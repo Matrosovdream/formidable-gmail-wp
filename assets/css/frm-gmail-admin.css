@@ -1,0 +1,45 @@
+.frm-gmail-wrap .frm-gmail-table-wrap {
+    margin-top: 16px;
+
+  }
+
+  .frm-gmail-wrap .frm-gmail-table-wrap input,
+.frm-gmail-wrap .frm-gmail-table-wrap textarea {
+    width: 100%;
+}
+  
+  .frm-gmail-wrap .frm-gmail-table textarea.code {
+    font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+  }
+  
+  .frm-gmail-wrap .frm-gmail-account input[type="text"],
+  .frm-gmail-wrap .frm-gmail-account textarea {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  
+  .frm-gmail-wrap .frm-gmail-account input[type="text"] {
+    margin-bottom: 8px;
+    padding: 6px 8px;
+  }
+  
+  .frm-gmail-wrap .frm-gmail-account textarea {
+    padding: 8px;
+    min-height: 120px;
+  }
+  
+  .frm-gmail-wrap .frm-gmail-table td {
+    vertical-align: top;
+    padding: 12px 10px;
+  }
+
+  .frm-gmail-wrap .frm-gmail-actions-head {
+    vertical-align: top;
+    text-align: center;
+  }
+  
+  .frm-gmail-wrap .frm-gmail-actions {
+    text-align: center;
+  }
+  
