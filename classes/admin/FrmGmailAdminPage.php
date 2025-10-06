@@ -69,16 +69,17 @@ final class FrmGmailAdminPage {
         if ( ! isset($_GET['page']) || $_GET['page'] !== self::MENU_SLUG ) {
             return;
         }
-        $ver = '1.1.1';
+        $ver = '1.1.2';
+        // These two lines assume FRM_GML_BASE_PATH holds a URL (as in your main plugin). If not, swap to self::base_url().
         wp_enqueue_style(
             'frm-gmail-admin',
-            self::base_url() . 'assets/css/frm-gmail-admin.css?t=' . time(),
+            (defined('FRM_GML_BASE_PATH') ? FRM_GML_BASE_PATH : self::base_url()) . 'assets/css/frm-gmail-admin.css?t=' . time(),
             [],
             $ver
         );
         wp_enqueue_script(
             'frm-gmail-admin',
-            self::base_url() . 'assets/js/frm-gmail-admin.js?t=' . time(),
+            (defined('FRM_GML_BASE_PATH') ? FRM_GML_BASE_PATH : self::base_url()) . 'assets/js/frm-gmail-admin.js?t=' . time(),
             ['jquery'],
             $ver,
             true
@@ -242,6 +243,12 @@ final class FrmGmailAdminPage {
             .frm-gmail-warn{color:#e65100}
             .frm-gmail-help{font-size:12px;color:#666;margin-top:6px}
             .frm-gmail-top-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:end}
+            .frm-gmail-test-results{margin-top:12px;border-top:1px solid #eee;padding-top:12px}
+            .frm-gmail-test-results .email-item{padding:8px 10px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;background:#fafafa}
+            .frm-gmail-test-results .email-item .subject{font-weight:600}
+            .frm-gmail-test-results .email-item .from{color:#555;font-size:12px}
+            .frm-gmail-test-results .email-item .mid{color:#888;font-size:11px;font-family:monospace}
+            .frm-gmail-test-results.error{border-color:#fbe9e7;background:#fff3e0;padding:12px;border-radius:8px}
             @media (max-width: 1100px){ .frm-gmail-card{flex:1 1 100%} .frm-gmail-top-grid{grid-template-columns:1fr} }
         </style>
 
@@ -306,7 +313,7 @@ final class FrmGmailAdminPage {
                     $statuses    = $row['statuses']         ?? '';
                     $token       = $row['token']            ?? null;
                     $email       = $row['connected_email']  ?? '';
-                    $connected   = is_array($token) && !empty(($token['access_token'] ?? '')) || !empty(($token['refresh_token'] ?? ''));
+                    $connected   = is_array($token) && ( !empty(($token['access_token'] ?? '')) || !empty(($token['refresh_token'] ?? '')) );
                     $connected_at= $row['connected_at']     ?? '';
                 ?>
                     <div class="frm-gmail-card" data-idx="<?php echo esc_attr($i); ?>">
@@ -368,7 +375,7 @@ final class FrmGmailAdminPage {
 
                                 <?php if ( $connected ): ?>
                                     <button type="button" class="button frm-gmail-test" data-idx="<?php echo esc_attr($i); ?>">
-                                        <?php esc_html_e('Test list', 'frm-gmail'); ?>
+                                        <?php esc_html_e('Test email list', 'frm-gmail'); ?>
                                     </button>
 
                                     <button type="submit" class="button" name="frm_gmail_disconnect_idx" value="<?php echo esc_attr($i); ?>">
@@ -378,6 +385,8 @@ final class FrmGmailAdminPage {
 
                                 <button type="button" class="button frm-gmail-remove" aria-label="<?php esc_attr_e('Delete block', 'frm-gmail'); ?>">✕</button>
                             </div>
+
+                            <!-- Results container will be injected here after the actions row -->
                         </div>
                     </div>
                 <?php endforeach; ?>
@@ -432,11 +441,7 @@ final class FrmGmailAdminPage {
                     </div>
 
                     <div class="frm-gmail-row frm-gmail-actions">
-                        <span class="frm-gmail-warn"><?php esc_html_e('Not connected. Click Connect to grant access.', 'frm-gmail'); ?></span>
-                        <button type="button" class="button button-primary frm-gmail-connect" data-idx="__index__">
-                            <?php esc_html_e('Connect', 'frm-gmail'); ?>
-                        </button>
-                        <button type="button" class="button frm-gmail-remove" aria-label="<?php esc_attr_e('Delete block', 'frm-gmail'); ?>">✕</button>
+                        <span class="frm-gmail-warn"><strong><?php esc_html_e('Save changes to establish connection', 'frm-gmail'); ?></strong></span>
                     </div>
                 </div>
             </div>
@@ -472,6 +477,17 @@ final class FrmGmailAdminPage {
                 });
             }
 
+            function ensureResultsContainer(actionsRow, idx){
+                let block = actionsRow.parentElement.querySelector('.frm-gmail-test-results');
+                if (!block) {
+                    block = document.createElement('div');
+                    block.className = 'frm-gmail-test-results';
+                    block.id = 'frm-gmail-test-results-' + idx;
+                    actionsRow.insertAdjacentElement('afterend', block);
+                }
+                return block;
+            }
+
             container.addEventListener('click', function(e){
                 const btnConnect = e.target.closest('.frm-gmail-connect');
                 if (btnConnect) {
@@ -491,10 +507,19 @@ final class FrmGmailAdminPage {
                 if (btnTest) {
                     e.preventDefault();
                     const idx = btnTest.dataset.idx;
+                    const card = btnTest.closest('.frm-gmail-card');
+                    const actionsRow = card.querySelector('.frm-gmail-actions');
+                    const block = ensureResultsContainer(actionsRow, idx);
+                    block.innerHTML = '<em><?php echo esc_js(__('Loading latest 5 emails…', 'frm-gmail')); ?></em>';
+
                     fetch(ajaxurl + '?action=<?php echo esc_js(self::AJAX_TEST_ACTION); ?>&idx=' + encodeURIComponent(idx), {credentials:'same-origin'})
                         .then(r => r.text())
-                        .then(t => alert(t.substring(0, 2000)))
-                        .catch(err => alert('Error: ' + err));
+                        .then(t => {
+                            block.innerHTML = t;
+                        })
+                        .catch(err => {
+                            block.innerHTML = '<div class="frm-gmail-test-results error"><p>' + (err && err.message ? err.message : 'Error') + '</p></div>';
+                        });
                     return;
                 }
             });
@@ -619,7 +644,7 @@ final class FrmGmailAdminPage {
         exit;
     }
 
-    /** Admin AJAX test: list a few messages for given account index */
+    /** Admin AJAX test: list a few messages for given account index — returns HTML snippet to inject under the actions row */
     public static function ajax_test_list(): void {
         if ( ! current_user_can(self::CAPABILITY) ) { wp_die('Forbidden'); }
 
@@ -627,19 +652,19 @@ final class FrmGmailAdminPage {
 
         $settings = self::get_settings();
         if ( ! isset($settings['accounts'][$idx]) ) {
-            wp_die('Account not found.');
+            wp_die('<div class="frm-gmail-test-results error"><p>Account not found.</p></div>');
         }
         $row   = $settings['accounts'][$idx];
         $creds = $row['credentials'] ?? '';
         $tok   = $row['token'] ?? null;
 
         if ( empty($tok) || ! is_array($tok) ) {
-            wp_die('Not connected.');
+            wp_die('<div class="frm-gmail-test-results error"><p>Not connected.</p></div>');
         }
 
         $client = self::make_google_client_from_credentials($creds);
         if ( ! $client ) {
-            wp_die('Invalid credentials.');
+            wp_die('<div class="frm-gmail-test-results error"><p>Invalid credentials JSON.</p></div>');
         }
 
         $client->setApplicationName('Gmail Parser (WP) - Account #' . ($idx + 1));
@@ -658,7 +683,7 @@ final class FrmGmailAdminPage {
                 $settings['accounts'][$idx]['token'] = $newTok;
                 update_option(self::OPTION_NAME, $settings, false);
             } else {
-                wp_die('Token expired and no refresh token present. Please Reconnect.');
+                wp_die('<div class="frm-gmail-test-results error"><p>Token expired and no refresh token present. Please Reconnect.</p></div>');
             }
         }
 
@@ -666,17 +691,29 @@ final class FrmGmailAdminPage {
             $gmail = new \Google\Service\Gmail($client);
             $list  = $gmail->users_messages->listUsersMessages('me', ['maxResults'=>5, 'q'=>'']);
             $msgs  = $list->getMessages() ?: [];
-            if ( ! $msgs ) { wp_die("No messages."); }
+
             ob_start();
-            foreach ($msgs as $m) {
-                $msg = $gmail->users_messages->get('me', $m->getId(), ['format'=>'metadata','metadataHeaders'=>['From','Subject']]);
-                $headers = [];
-                foreach ($msg->getPayload()->getHeaders() as $h) { $headers[$h->getName()] = $h->getValue(); }
-                echo "ID: {$m->getId()}\nFrom: ".($headers['From']??'')."\nSubject: ".($headers['Subject']??'')."\n----\n";
+            if ( ! $msgs ) {
+                echo '<div class="frm-gmail-test-results"><p><em>No messages.</em></p></div>';
+            } else {
+                echo '<div class="frm-gmail-test-results">';
+                foreach ($msgs as $m) {
+                    $msg = $gmail->users_messages->get('me', $m->getId(), ['format'=>'metadata','metadataHeaders'=>['From','Subject']]);
+                    $headers = [];
+                    foreach ($msg->getPayload()->getHeaders() as $h) { $headers[$h->getName()] = $h->getValue(); }
+                    $from = $headers['From'] ?? '';
+                    $subj = $headers['Subject'] ?? '';
+                    echo '<div class="email-item">';
+                    echo '<div class="subject">'. esc_html($subj) .'</div>';
+                    echo '<div class="from">'. esc_html($from) .'</div>';
+                    echo '<div class="mid">ID: '. esc_html($m->getId()) .'</div>';
+                    echo '</div>';
+                }
+                echo '</div>';
             }
-            wp_die( nl2br(esc_html(ob_get_clean())) );
+            wp_die( ob_get_clean() );
         } catch (\Throwable $e) {
-            wp_die('Error: ' . esc_html($e->getMessage()));
+            wp_die('<div class="frm-gmail-test-results error"><p>Error: '. esc_html($e->getMessage()) .'</p></div>');
         }
     }
 
@@ -741,11 +778,11 @@ final class FrmGmailAdminPage {
         return null;
     }
 
-    /** Ensure Google API Client is available */
+    /** Ensure Google API Client is available (use filesystem paths, not URLs) */
     private static function ensure_google_lib(): void {
         if (class_exists('\Google\Client')) { return; }
-        $vendor1 = self::base_path() . 'vendor/autoload.php';
-        $vendor2 = dirname(self::base_path()) . '/vendor/autoload.php';
+        $vendor1 = FRM_GML_BASE_URL . 'vendor/autoload.php';
+        $vendor2 = FRM_GML_BASE_URL . '/vendor/autoload.php';
         if ( file_exists($vendor1) ) { require_once $vendor1; return; }
         if ( file_exists($vendor2) ) { require_once $vendor2; return; }
     }
