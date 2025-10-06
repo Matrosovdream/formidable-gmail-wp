@@ -1,45 +1,17 @@
-.frm-gmail-wrap .frm-gmail-table-wrap {
-    margin-top: 16px;
-
-  }
-
-  .frm-gmail-wrap .frm-gmail-table-wrap input,
-.frm-gmail-wrap .frm-gmail-table-wrap textarea {
-    width: 100%;
-}
-  
-  .frm-gmail-wrap .frm-gmail-table textarea.code {
-    font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
-  }
-  
-  .frm-gmail-wrap .frm-gmail-account input[type="text"],
-  .frm-gmail-wrap .frm-gmail-account textarea {
-    display: block;
-    width: 100%;
-    box-sizing: border-box;
-  }
-  
-  .frm-gmail-wrap .frm-gmail-account input[type="text"] {
-    margin-bottom: 8px;
-    padding: 6px 8px;
-  }
-  
-  .frm-gmail-wrap .frm-gmail-account textarea {
-    padding: 8px;
-    min-height: 120px;
-  }
-  
-  .frm-gmail-wrap .frm-gmail-table td {
-    vertical-align: top;
-    padding: 12px 10px;
-  }
-
-  .frm-gmail-wrap .frm-gmail-actions-head {
-    vertical-align: top;
-    text-align: center;
-  }
-  
-  .frm-gmail-wrap .frm-gmail-actions {
-    text-align: center;
-  }
-  
+.frm-gmail-grid{display:flex;flex-wrap:wrap;gap:16px;margin-top:8px;}
+.frm-gmail-card{flex:1 1 calc(50% - 16px);min-width:360px;border:1px solid #ddd;border-radius:10px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.frm-gmail-card .card-hd{padding:12px 16px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center}
+.frm-gmail-card .card-bd{padding:16px}
+.frm-gmail-row{margin-bottom:12px}
+.frm-gmail-row label{display:block;font-weight:600;margin-bottom:4px}
+.frm-gmail-row .regular-text{width:100%}
+.frm-gmail-row textarea{width:100%}
+.frm-gmail-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.frm-gmail-status{font-weight:600}
+.frm-gmail-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
+.frm-gmail-badge.ok{background:#e8f5e9;color:#2e7d32;border:1px solid #c8e6c9}
+.frm-gmail-badge.no{background:#fff3e0;color:#e65100;border:1px solid #ffe0b2}
+.frm-gmail-warn{color:#e65100}
+.frm-gmail-help{font-size:12px;color:#666;margin-top:6px}
+.frm-gmail-top-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:end}
+@media (max-width: 1100px){ .frm-gmail-card{flex:1 1 100%} .frm-gmail-top-grid{grid-template-columns:1fr} }
