@@ -25,8 +25,14 @@ function formidable_gmail_init() {
     
     if( isset( $_GET['gmail'] ) ) {
 
-        
-        exit();
+        $result = FrmGmailParserHelper::getAllMessageAccounts();
+        //$result = FrmGmailParserHelper::updateEntryStatuses();
+
+
+        echo "<pre>";
+        print_r($result);
+        echo "</pre>";
+        die();
 
     }
 
