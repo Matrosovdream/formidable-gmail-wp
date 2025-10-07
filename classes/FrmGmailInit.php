@@ -9,41 +9,18 @@ class FrmGmailInit {
         // Helpers
         $this->include_helpers();
 
-        
-        /*
-        // API class
+        // API classes
         $this->include_api();
 
-        // Shortcodes
-        $this->include_shortcodes();
+        // Parsers
+        $this->include_parsers();
 
-        // Migrations
-        $this->include_migrations();
-
-        // Models
-        $this->include_models();
+        // Helpers
+        $this->include_helpers();
 
         // CRON
         $this->include_cron();
 
-        // Hooks
-        $this->include_hooks();
-
-        // Filters
-        $this->include_filters();
-
-        // Ajax actions
-        $this->include_ajax();
-
-        // Formidable Addons
-        $this->include_frm_addons();
-
-        // Routes
-        $this->include_routes();
-
-        // Webhooks
-        $this->include_webhooks();
-        */
 
     }
 
@@ -56,33 +33,24 @@ class FrmGmailInit {
     private function include_helpers() {
 
         // Settings Helper
-        require_once FRM_GML_BASE_URL.'/classes/helpers/FrmGmailSettingsHelper.php';
+        require_once FRM_GML_BASE_URL.'/classes/helpers/FrmGmailParserHelper.php';
 
-    }
-
-    private function include_migrations() {
-
-        // Entries cleaner extra tables
-        require_once FRM_GML_BASE_URL.'/classes//migrations/FrmEasypostMigrations.php';
-
-        // Run migrations
-        FrmEasypostMigrations::maybe_upgrade();
+        // Entry Helper
+        require_once FRM_GML_BASE_URL.'/classes/helpers/FrmGmailEntryHelper.php';
 
     }
 
     private function include_api() {
 
-        // Abstract API
-        require_once FRM_GML_BASE_URL.'/classes/api/FrmEasypostAbstractApi.php';
+        // Main API
+        require_once FRM_GML_BASE_URL.'/classes/api/FrmGmailApi.php';
 
-        // Shipment API
-        require_once FRM_GML_BASE_URL.'/classes/api/FrmEasypostShipmentApi.php';
+    }
 
-        // Address API
-        require_once FRM_GML_BASE_URL.'/classes/api/FrmEasypostAddressApi.php';
+    private function include_parsers() {
 
-        // Smarty API
-        require_once FRM_GML_BASE_URL.'/classes/api/Smarty/FrmSmartyApi.php';
+        // Main Parser
+        require_once FRM_GML_BASE_URL.'/classes/parsers/FrmGmailParser.php';
 
     }
 
@@ -114,26 +82,24 @@ class FrmGmailInit {
 
     }
 
-    private function include_utils() {
+    private function include_migrations() {
+
+        // Entries cleaner extra tables
+        require_once FRM_GML_BASE_URL.'/classes//migrations/FrmEasypostMigrations.php';
+
+        // Run migrations
+        FrmEasypostMigrations::maybe_upgrade();
 
     }
 
     private function include_cron() {
 
         // Abstract cron class
-        require_once FRM_GML_BASE_URL.'/classes/cron/FrmEasypostAbstractCron.php';
+        require_once FRM_GML_BASE_URL.'/classes/cron/FrmGmailAbstractCron.php';
 
-        // Shipments cron
-        require_once FRM_GML_BASE_URL.'/classes/cron/FrmEasypostShipmentsCron.php';
-        FrmEasypostShipmentsCron::init();
-
-        // Update entry status cron
-        require_once FRM_GML_BASE_URL.'/classes/cron/FrmUpdateEntryStatusCron.php';
-        FrmUpdateEntryStatusCron::init();
-
-        // Void shipments cron
-        require_once FRM_GML_BASE_URL.'/classes/cron/FrmVoidShipmentsCron.php';
-        FrmVoidShipmentsCron::init();
+        // Update entries cron
+        require_once FRM_GML_BASE_URL.'/classes/cron/FrmGmailUpdateEntriesCron.php';
+        FrmGmailUpdateEntriesCron::init();
 
     }
 
