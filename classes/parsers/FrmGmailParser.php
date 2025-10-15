@@ -4,7 +4,7 @@ if ( ! defined('ABSPATH') ) { exit; }
 /**
  * Parser:
  * - Gmail query is built ONLY from statuses (+ optional start_date)
- * - Masks are applied AFTER fetching results (Subject + From), and {entry_id} is extracted then
+ * - Masks are applied AFTER fetching results (Delivered-To ONLY), and {entry_id} is extracted then
  * - {entry_id} captures DIGITS ONLY (\d+) to support patterns like store+12345@...
  */
 final class FrmGmailParser {
@@ -40,28 +40,84 @@ final class FrmGmailParser {
         };
         $statuses = array_values(array_filter(array_map('trim', $statuses), fn($s) => $s !== ''));
         if (!$statuses) { return ''; }
-    
+
         $statusTerms = array_map(fn($s) => 'subject:"'.$esc($s).'"', $statuses);
         $q = '(' . implode(' OR ', $statusTerms) . ')';
-    
-        // <-- ADD/KEEP THIS: inject start date into Gmail query
+
         if ($startDate && preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)) {
             $q .= ' after:' . str_replace('-', '/', $startDate); // Gmail expects YYYY/MM/DD
         }
         return $q;
     }
 
+    /** ---- Helpers to decode message bodies ---- */
+
+    /** Base64url decode */
+    private static function b64url_decode(string $data): string {
+        $data = strtr($data, '-_', '+/');
+        $pad  = strlen($data) % 4;
+        if ($pad) { $data .= str_repeat('=', 4 - $pad); }
+        return base64_decode($data) ?: '';
+    }
+
+    /** Recursively collect parts by mime */
+    private static function collectPartsByMime($payload, string $wantMime, array &$out): void {
+        if (!$payload) { return; }
+        $mimeType = method_exists($payload, 'getMimeType') ? $payload->getMimeType() : '';
+        if ($mimeType === $wantMime && method_exists($payload, 'getBody') && $payload->getBody()) {
+            $raw = $payload->getBody()->getData() ?? '';
+            if ($raw !== '') {
+                $out[] = self::b64url_decode($raw);
+            }
+        }
+        if (method_exists($payload, 'getParts') && $payload->getParts()) {
+            foreach ($payload->getParts() as $p) {
+                self::collectPartsByMime($p, $wantMime, $out);
+            }
+        }
+    }
+
+    /** Extract best-effort plain body (prefer text/plain; else strip tags from text/html; else fallback to decoded body) */
+    private static function extractPlainBody(\Google\Service\Gmail\Message $msg): string {
+        $payload = $msg->getPayload();
+        if (!$payload) { return ''; }
+
+        // First try text/plain parts
+        $plain = [];
+        self::collectPartsByMime($payload, 'text/plain', $plain);
+        if (!empty($plain)) {
+            return trim(implode("\n\n", $plain));
+        }
+
+        // Next try text/html parts (strip tags)
+        $html = [];
+        self::collectPartsByMime($payload, 'text/html', $html);
+        if (!empty($html)) {
+            $joined = trim(implode("\n\n", $html));
+            // Basic html to text
+            $text = wp_strip_all_tags($joined, true);
+            return trim(html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+
+        // Fallback: sometimes the body is directly on the payload
+        if ($payload->getBody() && $payload->getBody()->getSize() > 0) {
+            $raw = $payload->getBody()->getData() ?? '';
+            return trim(self::b64url_decode($raw));
+        }
+
+        return '';
+    }
+
     /**
-     * NEW: Fetch and post-filter messages.
+     * Fetch and post-filter messages.
      *
      * @param int  $idx        Account index (option row)
-     * @param int  $batchSize  Number of message IDs per Gmail API page (default 50)
+     * @param int  $batchSize  Number of message IDs per Gmail API page (default 500)
      * @param int  $maxPages   Max number of pages to scan (default 3)
      *
      * @return array {
-     *   @type array       $items  List of filtered messages:
-     *                             [ ['id','from','subject','status','entryId'], ... ]
-     *   @type null|string $error  Error string if something failed
+     *   @type array       $items  [ ['id','from','subject','status','entryId','body'], ... ]
+     *   @type null|string $error
      * }
      */
     public static function getAllMessages(int $idx, int $batchSize = 500, int $maxPages = 3): array {
@@ -122,45 +178,52 @@ final class FrmGmailParser {
                 $pageToken = $list->getNextPageToken();
 
                 foreach ($msgs as $m) {
-                    // Minimal headers
-                    $msg = $gmail->users_messages->get('me', $m->getId(), [
-                        'format' => 'metadata',
-                        'metadataHeaders' => ['From','Subject']
-                    ]);
+                    // Get FULL message to access body
+                    $msg = $gmail->users_messages->get('me', $m->getId(), ['format' => 'full']);
 
+                    // Headers
                     $headers = [];
                     foreach ($msg->getPayload()->getHeaders() as $h) { $headers[$h->getName()] = $h->getValue(); }
-                    $from = $headers['From'] ?? '';
-                    $subj = $headers['Subject'] ?? '';
+                    $from         = $headers['From'] ?? '';
+                    $deliveredTo  = $headers['Delivered-To'] ?? ($headers['To'] ?? '');
+                    $subject      = $headers['Subject'] ?? '';
 
-                    // If masks exist: require match in Subject OR From; extract entry_id (digits only)
+                    // Body (plain text best-effort)
+                    $body = self::extractPlainBody($msg);
+
+                    // If masks exist: require match ONLY in Delivered-To; extract {entry_id} (digits only)
                     $entryId = '';
                     if ($hasMasks) {
                         $matchedMask = false;
+
                         foreach ($masks as $mm) {
-                            if (preg_match($mm['regex'], $subj, $cap) || preg_match($mm['regex'], $from, $cap)) {
+
+                            if (preg_match($mm['regex'], $deliveredTo, $cap)) {
                                 $entryId = $cap['entry_id'] ?? '';
                                 $matchedMask = true;
                                 break;
                             }
                         }
                         if (!$matchedMask) {
-                            continue; // skip this message (no mask match)
+                            continue; // skip this message (no mask match in Delivered-To)
                         }
                     }
 
-                    // Determine matched status by Subject (best-effort)
+                    // Determine matched status from Subject OR Body
                     $matchedStatus = '';
+                    $haystack = $subject . "\n" . $body;
                     foreach ($statusesRx as $i => $rx) {
-                        if (preg_match($rx, $subj)) { $matchedStatus = $statuses[$i]; break; }
+                        if (preg_match($rx, $haystack)) { $matchedStatus = $statuses[$i]; break; }
                     }
 
                     $items[] = [
-                        'id'      => $m->getId(),
-                        'from'    => $from,
-                        'subject' => $subj,
-                        'status'  => $matchedStatus,
-                        'entryId' => $entryId,
+                        'id'         => $m->getId(),
+                        'from'       => $from,
+                        'deliveredTo'=> $deliveredTo,
+                        'subject'    => $subject,
+                        'status'     => $matchedStatus,
+                        'entryId'    => $entryId,
+                        'body'       => $body,
                     ];
                 }
 
@@ -176,7 +239,7 @@ final class FrmGmailParser {
 
     /**
      * Render the small preview block (uses getAllMessages()).
-     * Keeps output identical to before; shows up to 5 items.
+     * Shows up to 5 items, including the body snippet.
      *
      * @param int    $idx
      * @param string $oauthRedirectUri (kept for signature compatibility; not required here)
@@ -195,24 +258,28 @@ final class FrmGmailParser {
             return '<div class="frm-gmail-test-results error"><p>Error: ' . esc_html($result['error']) . '</p></div>';
         }
 
-        $items = $result['items'];
-        $items = array_slice($items, 0, 5); // preview top 5
+        $items = array_slice($result['items'], 0, 5); // preview top 5
 
         ob_start();
         if (!$items) {
             $msg = $hasMasks
-                ? '<em>No messages matched the masks for the selected statuses.</em>'
+                ? '<em>No messages matched the masks (in Delivered-To) for the selected statuses.</em>'
                 : '<em>No messages for the selected statuses.</em>';
             echo '<div class="frm-gmail-test-results"><p>'.$msg.'</p></div>';
         } else {
             echo '<div class="frm-gmail-test-results">';
             foreach ($items as $row) {
+                $body    = (string)($row['body'] ?? '');
+                $snippet = mb_substr($body, 0, 800);
+                $more    = mb_strlen($body) > 800 ? '…' : '';
+
                 echo '<div class="email-item">';
                 echo '<div class="subject">'. esc_html($row['subject']) .'</div>';
-                echo '<div class="from">'. esc_html($row['from']) .'</div>';
-                echo '<div class="mid">ID: '. esc_html($row['id']) .'</div>';
+                echo '<div class="from">'. esc_html__('From: ', 'frm-gmail'). esc_html($row['from']) .'</div>';
+                echo '<div class="to">'. esc_html__('Delivered-To: ', 'frm-gmail'). esc_html($row['deliveredTo']) .'</div>';
                 echo '<div class="status">'. esc_html__('Status: ', 'frm-gmail') . '<strong>' . esc_html($row['status'] ?: __('(not found)', 'frm-gmail')) . '</strong></div>';
                 echo '<div class="status">'. esc_html__('Entry ID: ', 'frm-gmail') . '<strong>' . esc_html($row['entryId'] ?: __('(not found)', 'frm-gmail')) . '</strong></div>';
+                echo '<div class="body"><strong>'. esc_html__('Body:', 'frm-gmail') .'</strong><br>' . nl2br(esc_html($snippet)) . $more . '</div>';
                 echo '</div>';
             }
             echo '</div>';
