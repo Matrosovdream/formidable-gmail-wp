@@ -2,7 +2,8 @@
 if ( ! defined('ABSPATH') ) { exit; }
 
 /**
- * Admin UI + OAuth + AJAX wiring.
+ * Admin UI + OAuth + AJAX wiring (multi-filter per account + status normalization + default subject area).
+ * Adds Order Id Search area (placed before Order Id Mask) and forces Order Id Mask to be a single value.
  * Uses:
  *  - FrmGmailParserHelper for settings & utils
  *  - FrmGmailApi for Google Client + token handling
@@ -20,8 +21,6 @@ final class FrmGmailAdminPage {
     private const AJAX_OAUTH_ACTION = 'frm_gmail_oauth';
     private const AJAX_TEST_ACTION  = 'frm_gmail_test_list';
     private const STATE_PREFIX      = 'frm_gmail_state_'; // transient key prefix
-
-    /** Optional override: define('FRM_GML_REDIRECT_OVERRIDE', 'https://your.tld/wp-admin/admin-ajax.php?action=frm_gmail_oauth'); */
 
     /** Bootstrap everything (admin UI + public OAuth endpoints) */
     public static function bootstrap(): void {
@@ -58,7 +57,7 @@ final class FrmGmailAdminPage {
         if ( ! isset($_GET['page']) || $_GET['page'] !== self::MENU_SLUG ) {
             return;
         }
-        $ver = '1.1.2';
+        $ver = '1.4.1';
         $baseUrl = (defined('FRM_GML_BASE_PATH') ? FRM_GML_BASE_PATH : FrmGmailParserHelper::baseUrl());
 
         wp_enqueue_style(
@@ -113,9 +112,7 @@ final class FrmGmailAdminPage {
                 ], 30);
             }
 
-            // If this was triggered from the Test button via AJAX, return JSON and do not redirect
             if ( isset($_POST['frm_gmail_ajax']) && $_POST['frm_gmail_ajax'] === '1' ) {
-                // Reuse the same notices logic above; just respond success here.
                 wp_send_json_success([ 'saved' => true ]);
             }
 
@@ -136,23 +133,71 @@ final class FrmGmailAdminPage {
         $safe_accounts = [];
         if ( isset($raw['accounts']) && is_array($raw['accounts']) ) {
             foreach ( $raw['accounts'] as $i => $row ) {
-                $title            = isset($row['title']) ? sanitize_text_field($row['title']) : '';
-                $credentials      = isset($row['credentials']) ? FrmGmailParserHelper::sanitizeTextareaKeepJson($row['credentials']) : '';
-                $mask             = isset($row['mask']) ? sanitize_text_field($row['mask']) : '';
-                $statuses         = isset($row['statuses']) ? FrmGmailParserHelper::sanitizeTextareaSimple($row['statuses']) : '';
-                $status_field_id  = isset($row['status_field_id']) ? absint($row['status_field_id']) : 0; // <-- NEW
+                // General (always present)
+                $title       = isset($row['title']) ? sanitize_text_field($row['title']) : '';
+                $credentials = isset($row['credentials']) ? FrmGmailParserHelper::sanitizeTextareaKeepJson($row['credentials']) : '';
 
-                // Skip empty blocks
-                if ($title === '' && $credentials === '' && $mask === '' && $statuses === '' && $status_field_id === 0) {
+                // Filters (array of sub-blocks)
+                $filters_in  = isset($row['filters']) && is_array($row['filters']) ? $row['filters'] : [];
+                $filters_out = [];
+
+                foreach ( $filters_in as $fidx => $frow ) {
+                    $parser_code = isset($frow['parser_code']) ? sanitize_text_field($frow['parser_code']) : '';
+                    $title_filter= isset($frow['title_filter']) ? sanitize_text_field($frow['title_filter']) : '';
+                    $mask        = isset($frow['mask']) ? sanitize_text_field($frow['mask']) : ''; // single value
+                    $status      = isset($frow['status']) ? sanitize_text_field($frow['status']) : '';
+                    $status_field_id = isset($frow['status_field_id']) ? absint($frow['status_field_id']) : 0;
+
+                    // Order Id Search area (to|from|subject)
+                    $order_id_search_area = 'subject';
+                    if ( isset($frow['order_id_search_area']) ) {
+                        $candidate = sanitize_text_field($frow['order_id_search_area']);
+                        if ( in_array($candidate, ['to','from','subject'], true) ) {
+                            $order_id_search_area = $candidate;
+                        }
+                    }
+
+                    $status_search_area = [];
+                    if ( isset($frow['status_search_area']) ) {
+                        $areas = (array) $frow['status_search_area'];
+                        foreach ($areas as $a) {
+                            $a = sanitize_text_field($a);
+                            if (in_array($a, ['body','subject'], true)) {
+                                $status_search_area[] = $a;
+                            }
+                        }
+                    }
+
+                    // Skip empty filter rows (all blank)
+                    $filterAllEmpty = ($parser_code==='' && $title_filter==='' && $mask==='' && empty($status_search_area) && $status==='' && $status_field_id===0 && $order_id_search_area==='subject');
+                    if ($filterAllEmpty) { continue; }
+
+                    // If no area chosen, default to subject (so tests work)
+                    if (empty($status_search_area)) {
+                        $status_search_area = ['subject'];
+                    }
+
+                    $filters_out[] = [
+                        'parser_code'           => $parser_code,
+                        'title_filter'          => $title_filter,
+                        'mask'                  => $mask, // single
+                        'order_id_search_area'  => $order_id_search_area,
+                        'status_search_area'    => $status_search_area,
+                        'status'                => $status,
+                        'status_field_id'       => $status_field_id,
+                    ];
+                }
+
+                // Entire account empty?
+                $accountEmpty = ($title==='' && $credentials==='' && empty($filters_out));
+                if ( $accountEmpty ) {
                     continue;
                 }
 
                 $new = [
-                    'title'           => $title,
-                    'credentials'     => $credentials,
-                    'mask'            => $mask,
-                    'statuses'        => $statuses,
-                    'status_field_id' => $status_field_id, // <-- NEW
+                    'title'       => $title,
+                    'credentials' => $credentials,
+                    'filters'     => array_values($filters_out),
                 ];
 
                 // Preserve token + connected_* if credentials unchanged
@@ -168,7 +213,6 @@ final class FrmGmailAdminPage {
                 $safe_accounts[] = $new;
             }
         }
-
 
         $to_save = [
             'parser'   => [ 'start_date' => $start_date ],
@@ -196,7 +240,7 @@ final class FrmGmailAdminPage {
         exit;
     }
 
-    /** Render admin page (UI unchanged; now uses Helper to read settings) */
+    /** Render admin page */
     public static function render_page(): void {
         if ( ! current_user_can(self::CAPABILITY) ) {
             wp_die(__('You do not have permission to view this page.', 'frm-gmail'));
@@ -213,8 +257,6 @@ final class FrmGmailAdminPage {
         $notice   = get_transient('frm_gmail_notice');
         if ($notice) { delete_transient('frm_gmail_notice'); }
 
-        // (The rest of the HTML is the same as your original; unchanged for brevity)
-        // ——— BEGIN PAGE HTML ———
         ?>
         <style>
             .frm-gmail-grid{display:flex;flex-wrap:wrap;gap:16px;margin-top:8px;}
@@ -233,13 +275,20 @@ final class FrmGmailAdminPage {
             .frm-gmail-warn{color:#e65100}
             .frm-gmail-help{font-size:12px;color:#666;margin-top:6px}
             .frm-gmail-top-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:end}
-            .frm-gmail-test-results{margin-top:12px;border-top:1px solid #eee;padding-top:12px}
+            .frm-gmail-test-results{padding-top:12px}
             .frm-gmail-test-results .email-item{padding:8px 10px;border:1px solid #eee;border-radius:8px;margin-bottom:8px;background:#fafafa}
             .frm-gmail-test-results .email-item .subject{font-weight:600}
             .frm-gmail-test-results .email-item .from{color:#555;font-size:12px}
             .frm-gmail-test-results .email-item .mid{color:#888;font-size:11px;font-family:monospace}
             .frm-gmail-test-results .email-item .status{margin-top:4px;font-size:12px}
             .frm-gmail-test-results.error{border-color:#fbe9e7;background:#fff3e0;padding:12px;border-radius:8px}
+            .frm-gmail-filter-box{margin-top:10px;padding:12px;border:1px dashed #ddd;border-radius:8px;background:#fbfbfb}
+            .frm-gmail-filter-box h4{margin:0 0 10px 0;font-size:14px}
+            .frm-gmail-filter-grid{display:flex;flex-direction:column;gap:12px}
+            .frm-gmail-filter{padding:12px;border:1px solid #eee;border-radius:8px;background:#fff}
+            .frm-gmail-filter .filter-actions{display:flex;gap:8px;align-items:center;margin-top:8px}
+            .frm-gmail-filter .filter-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+            .frm-gmail-filter .filter-head strong{font-size:13px}
             @media (max-width: 1100px){ .frm-gmail-card{flex:1 1 100%} .frm-gmail-top-grid{grid-template-columns:1fr} }
         </style>
 
@@ -298,10 +347,10 @@ final class FrmGmailAdminPage {
                 <?php
                 $rows = is_array($settings['accounts']) && $settings['accounts'] ? $settings['accounts'] : [[]];
                 foreach ( $rows as $i => $row ):
-                    $title       = $row['title']            ?? '';
-                    $credentials = $row['credentials']      ?? '';
-                    $mask        = $row['mask']             ?? '';
-                    $statuses    = $row['statuses']         ?? '';
+                    $title        = $row['title']            ?? '';
+                    $credentials  = $row['credentials']      ?? '';
+                    $filters      = isset($row['filters']) && is_array($row['filters']) ? $row['filters'] : [[]];
+
                     $token       = $row['token']            ?? null;
                     $email       = $row['connected_email']  ?? '';
                     $connected   = is_array($token) && ( !empty(($token['access_token'] ?? '')) || !empty(($token['refresh_token'] ?? '')) );
@@ -314,7 +363,9 @@ final class FrmGmailAdminPage {
                                 <?php echo $connected ? esc_html__('Connected', 'frm-gmail') : esc_html__('Not connected', 'frm-gmail'); ?>
                             </span>
                         </div>
+
                         <div class="card-bd">
+                            <!-- General block: ONLY Title + Credentials -->
                             <div class="frm-gmail-row">
                                 <label><?php esc_html_e('Account title', 'frm-gmail'); ?></label>
                                 <input type="text" class="regular-text" 
@@ -333,35 +384,7 @@ final class FrmGmailAdminPage {
                                 </div>
                             </div>
 
-                            <div class="frm-gmail-row">
-                                <label><?php esc_html_e('Gmail mask with Order Id', 'frm-gmail'); ?></label>
-                                <input type="text" class="regular-text"
-                                    name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][mask]"
-                                    value="<?php echo esc_attr($mask); ?>"
-                                    placeholder="<?php esc_attr_e('e.g. order-{entry_id}, invoice-{entry_id}, ORDER#{entry_id}', 'frm-gmail'); ?>">
-                                <div class="frm-gmail-help">
-                                    <?php esc_html_e('Comma-separated subject masks. Use {entry_id} placeholder. Examples: order-{entry_id}, ORDER#{entry_id}, OID:{entry_id}, ticket-{entry_id}', 'frm-gmail'); ?>
-                                </div>
-                            </div>
-
-                            <div class="frm-gmail-row">
-                                <label><?php esc_html_e('Statuses (in subject)', 'frm-gmail'); ?></label>
-                                <textarea class="large-text code" rows="4"
-                                    name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][statuses]"
-                                    placeholder="<?php esc_attr_e('e.g. Paid, Refunded, Cancelled (comma or new line)', 'frm-gmail'); ?>"><?php echo esc_textarea($statuses); ?></textarea>
-                            </div>
-
-                            <div class="frm-gmail-row">
-                                <label><?php esc_html_e('Status Field Id', 'frm-gmail'); ?></label>
-                                <input type="number" min="0" step="1" class="regular-text"
-                                    name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][status_field_id]"
-                                    value="<?php echo isset($row['status_field_id']) ? esc_attr( (int) $row['status_field_id'] ) : '0'; ?>"
-                                    placeholder="<?php esc_attr_e('Formidable status field ID (e.g. 7)', 'frm-gmail'); ?>">
-                                <div class="frm-gmail-help">
-                                    <?php esc_html_e('Optional. Formidable field ID where you store parsed status.', 'frm-gmail'); ?>
-                                </div>
-                            </div>
-
+                            <!-- Button block (after Credentials) -->
                             <div class="frm-gmail-row frm-gmail-actions">
                                 <?php if ( $connected ): ?>
                                     <span class="frm-gmail-status">
@@ -379,8 +402,8 @@ final class FrmGmailAdminPage {
                                 </button>
 
                                 <?php if ( $connected ): ?>
-                                    <button type="button" class="button frm-gmail-test" data-idx="<?php echo esc_attr($i); ?>">
-                                        <?php esc_html_e('Test email list', 'frm-gmail'); ?>
+                                    <button type="button" class="button frm-gmail-test-account" data-idx="<?php echo esc_attr($i); ?>">
+                                        <?php esc_html_e('Test email list (no filter)', 'frm-gmail'); ?>
                                     </button>
 
                                     <button type="submit" class="button" name="frm_gmail_disconnect_idx" value="<?php echo esc_attr($i); ?>">
@@ -389,6 +412,114 @@ final class FrmGmailAdminPage {
                                 <?php endif; ?>
 
                                 <button type="button" class="button frm-gmail-remove" aria-label="<?php esc_attr_e('Delete block', 'frm-gmail'); ?>">✕</button>
+                            </div>
+
+                            <!-- Filters (multiple per account) -->
+                            <div class="frm-gmail-filter-box" data-idx="<?php echo esc_attr($i); ?>">
+                                <h4><?php esc_html_e('Filters', 'frm-gmail'); ?></h4>
+                                <div class="frm-gmail-filter-grid">
+                                <?php
+                                $filters = $filters ?: [[]];
+                                foreach ($filters as $fi => $frow):
+                                    $parser_code = $frow['parser_code'] ?? '';
+                                    $title_filter= $frow['title_filter'] ?? '';
+                                    $mask        = $frow['mask'] ?? '';
+                                    $status_area = (array)($frow['status_search_area'] ?? []);
+                                    $status_val  = $frow['status'] ?? '';
+                                    $status_field= isset($frow['status_field_id']) ? (int)$frow['status_field_id'] : 0;
+                                    $default_subject_selected = empty($status_area) || in_array('subject', $status_area, true);
+
+                                    $order_id_area = $frow['order_id_search_area'] ?? 'subject';
+                                    if (!in_array($order_id_area, ['to','from','subject'], true)) {
+                                        $order_id_area = 'subject';
+                                    }
+                                ?>
+                                    <div class="frm-gmail-filter" data-idx="<?php echo esc_attr($i); ?>" data-fidx="<?php echo esc_attr($fi); ?>">
+                                        <div class="filter-head">
+                                            <strong><?php echo esc_html( sprintf(__('Filter #%d', 'frm-gmail'), $fi + 1) ); ?></strong>
+                                            <button type="button" class="button-link-delete frm-remove-filter" title="<?php esc_attr_e('Remove filter', 'frm-gmail'); ?>">✕</button>
+                                        </div>
+
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Parser code', 'frm-gmail'); ?></label>
+                                            <input type="text" class="regular-text"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][parser_code]"
+                                                value="<?php echo esc_attr($parser_code); ?>"
+                                                placeholder="<?php esc_attr_e('e.g. UPS, DHL, AMZ, CUSTOM', 'frm-gmail'); ?>">
+                                        </div>
+
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Title filter', 'frm-gmail'); ?></label>
+                                            <input type="text" class="regular-text"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][title_filter]"
+                                                value="<?php echo esc_attr($title_filter); ?>"
+                                                placeholder="<?php esc_attr_e('Substring to match in subject/title', 'frm-gmail'); ?>">
+                                        </div>
+
+                                        <!-- Order Id Search area BEFORE Order Id Mask -->
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Order Id Search area', 'frm-gmail'); ?></label>
+                                            <select class="regular-text frm-order-id-area"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][order_id_search_area]">
+                                                <option value="to"      <?php selected($order_id_area==='to'); ?>><?php esc_html_e('Email To', 'frm-gmail'); ?></option>
+                                                <option value="from"    <?php selected($order_id_area==='from'); ?>><?php esc_html_e('Email From', 'frm-gmail'); ?></option>
+                                                <option value="subject" <?php selected($order_id_area==='subject'); ?>><?php esc_html_e('Subject', 'frm-gmail'); ?></option>
+                                            </select>
+                                        </div>
+
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Order Id Mask', 'frm-gmail'); ?></label>
+                                            <input type="text" class="regular-text frm-mask"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][mask]"
+                                                value="<?php echo esc_attr($mask); ?>"
+                                                placeholder="<?php esc_attr_e('e.g. order-{entry_id}', 'frm-gmail'); ?>">
+                                            <div class="frm-gmail-help">
+                                                <?php esc_html_e('Single mask pattern. Use {entry_id} placeholder.', 'frm-gmail'); ?>
+                                            </div>
+                                        </div>
+
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Status search area', 'frm-gmail'); ?></label>
+                                            <select multiple size="2" class="regular-text frm-status-area"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][status_search_area][]">
+                                                <option value="subject" <?php selected($default_subject_selected); ?>><?php esc_html_e('subject', 'frm-gmail'); ?></option>
+                                                <option value="body"    <?php selected(in_array('body', $status_area, true));    ?>><?php esc_html_e('body', 'frm-gmail'); ?></option>
+                                            </select>
+                                            <div class="frm-gmail-help"><?php esc_html_e('Choose where to search for the status token.', 'frm-gmail'); ?></div>
+                                        </div>
+
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Status (comma-separated)', 'frm-gmail'); ?></label>
+                                            <input type="text" class="regular-text frm-status"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][status]"
+                                                value="<?php echo esc_attr($status_val); ?>"
+                                                placeholder="<?php esc_attr_e('e.g. Paid, Refunded, Cancelled', 'frm-gmail'); ?>">
+                                        </div>
+
+                                        <div class="frm-gmail-row">
+                                            <label><?php esc_html_e('Status Field Id', 'frm-gmail'); ?></label>
+                                            <input type="number" min="0" step="1" class="regular-text frm-status-field"
+                                                name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][filters][<?php echo esc_attr($fi); ?>][status_field_id]"
+                                                value="<?php echo esc_attr( $status_field ); ?>"
+                                                placeholder="<?php esc_attr_e('Formidable status field ID (e.g. 7)', 'frm-gmail'); ?>">
+                                            <div class="frm-gmail-help">
+                                                <?php esc_html_e('Optional. Formidable field ID where you store parsed status.', 'frm-gmail'); ?>
+                                            </div>
+                                        </div>
+
+                                        <div class="filter-actions" style="display: block;">
+                                            <button type="button" class="button frm-test-filter" data-idx="<?php echo esc_attr($i); ?>" data-fidx="<?php echo esc_attr($fi); ?>">
+                                                <?php esc_html_e('Test this filter', 'frm-gmail'); ?>
+                                            </button>
+                                            <div class="frm-gmail-test-results" id="frm-gmail-test-results-<?php echo esc_attr($i); ?>-<?php echo esc_attr($fi); ?>"></div>
+                                        </div>
+                                    </div>
+                                <?php endforeach; ?>
+                                </div>
+
+                                <p style="margin-top:8px;">
+                                    <button type="button" class="button button-secondary frm-add-filter" data-idx="<?php echo esc_attr($i); ?>"><?php esc_html_e('Add filter', 'frm-gmail'); ?></button>
+                                </p>
                             </div>
                         </div>
                     </div>
@@ -412,6 +543,7 @@ final class FrmGmailAdminPage {
                     <span class="frm-gmail-badge no"><?php esc_html_e('Not connected', 'frm-gmail'); ?></span>
                 </div>
                 <div class="card-bd">
+                    <!-- General -->
                     <div class="frm-gmail-row">
                         <label><?php esc_html_e('Account title', 'frm-gmail'); ?></label>
                         <input type="text" class="regular-text" 
@@ -429,158 +561,417 @@ final class FrmGmailAdminPage {
                         </div>
                     </div>
 
-                    <div class="frm-gmail-row">
-                        <label><?php esc_html_e('Gmail mask with Order Id', 'frm-gmail'); ?></label>
-                        <input type="text" class="regular-text"
-                            name="frm_gmail[accounts][__index__][mask]"
-                            placeholder="<?php esc_attr_e('e.g. order-{entry_id}, invoice-{entry_id}, ORDER#{entry_id}', 'frm-gmail'); ?>">
-                        <div class="frm-gmail-help">
-                            <?php esc_html_e('Comma-separated subject masks. Use {entry_id} placeholder.', 'frm-gmail'); ?>
-                        </div>
-                    </div>
-
-                    <div class="frm-gmail-row">
-                        <label><?php esc_html_e('Statuses (in subject)', 'frm-gmail'); ?></label>
-                        <textarea class="large-text code" rows="4"
-                            name="frm_gmail[accounts][__index__][statuses]"
-                            placeholder="<?php esc_attr_e('e.g. Paid, Refunded, Cancelled', 'frm-gmail'); ?>"></textarea>
-                    </div>
-
-                    <div class="frm-gmail-row">
-                        <label><?php esc_html_e('Status Field Id', 'frm-gmail'); ?></label>
-                        <input type="number" min="0" step="1" class="regular-text"
-                            name="frm_gmail[accounts][__index__][status_field_id]"
-                            value="0"
-                            placeholder="<?php esc_attr_e('Formidable status field ID (e.g. 7)', 'frm-gmail'); ?>">
-                        <div class="frm-gmail-help">
-                            <?php esc_html_e('Optional. Formidable field ID where you store parsed status.', 'frm-gmail'); ?>
-                        </div>
-                    </div>
-
+                    <!-- Button block -->
                     <div class="frm-gmail-row frm-gmail-actions">
                         <span class="frm-gmail-warn"><strong><?php esc_html_e('Save changes to establish connection', 'frm-gmail'); ?></strong></span>
+                        <button type="button" class="button frm-gmail-remove" aria-label="<?php esc_attr_e('Delete block', 'frm-gmail'); ?>">✕</button>
                     </div>
+
+                    <!-- Filters -->
+                    <div class="frm-gmail-filter-box" data-idx="__index__">
+                        <h4><?php esc_html_e('Filters', 'frm-gmail'); ?></h4>
+                        <div class="frm-gmail-filter-grid">
+                            <!-- one empty filter to start -->
+                            <div class="frm-gmail-filter" data-idx="__index__" data-fidx="0">
+                                <div class="filter-head">
+                                    <strong><?php esc_html_e('Filter #1', 'frm-gmail'); ?></strong>
+                                    <button type="button" class="button-link-delete frm-remove-filter" title="<?php esc_attr_e('Remove filter', 'frm-gmail'); ?>">✕</button>
+                                </div>
+
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Parser code', 'frm-gmail'); ?></label>
+                                    <input type="text" class="regular-text"
+                                        name="frm_gmail[accounts][__index__][filters][0][parser_code]"
+                                        placeholder="<?php esc_attr_e('e.g. UPS, DHL, AMZ, CUSTOM', 'frm-gmail'); ?>">
+                                </div>
+
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Title filter', 'frm-gmail'); ?></label>
+                                    <input type="text" class="regular-text"
+                                        name="frm_gmail[accounts][__index__][filters][0][title_filter]"
+                                        placeholder="<?php esc_attr_e('Substring to match in subject/title', 'frm-gmail'); ?>">
+                                </div>
+
+                                <!-- Order Id Search area BEFORE Order Id Mask -->
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Order Id Search area', 'frm-gmail'); ?></label>
+                                    <select class="regular-text frm-order-id-area"
+                                        name="frm_gmail[accounts][__index__][filters][0][order_id_search_area]">
+                                        <option value="to"><?php esc_html_e('Email To', 'frm-gmail'); ?></option>
+                                        <option value="from"><?php esc_html_e('Email From', 'frm-gmail'); ?></option>
+                                        <option value="subject" selected><?php esc_html_e('Subject', 'frm-gmail'); ?></option>
+                                    </select>
+                                </div>
+
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Order Id Mask', 'frm-gmail'); ?></label>
+                                    <input type="text" class="regular-text frm-mask"
+                                        name="frm_gmail[accounts][__index__][filters][0][mask]"
+                                        placeholder="<?php esc_attr_e('e.g. order-{entry_id}', 'frm-gmail'); ?>">
+                                    <div class="frm-gmail-help">
+                                        <?php esc_html_e('Single mask pattern. Use {entry_id} placeholder.', 'frm-gmail'); ?>
+                                    </div>
+                                </div>
+
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Status search area', 'frm-gmail'); ?></label>
+                                    <select multiple size="2" class="regular-text frm-status-area"
+                                        name="frm_gmail[accounts][__index__][filters][0][status_search_area][]">
+                                        <option value="subject" selected><?php esc_html_e('subject', 'frm-gmail'); ?></option>
+                                        <option value="body"><?php esc_html_e('body', 'frm-gmail'); ?></option>
+                                    </select>
+                                </div>
+
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Status (comma-separated)', 'frm-gmail'); ?></label>
+                                    <input type="text" class="regular-text frm-status"
+                                        name="frm_gmail[accounts][__index__][filters][0][status]"
+                                        placeholder="<?php esc_attr_e('e.g. Paid, Refunded, Cancelled', 'frm-gmail'); ?>">
+                                </div>
+
+                                <div class="frm-gmail-row">
+                                    <label><?php esc_html_e('Status Field Id', 'frm-gmail'); ?></label>
+                                    <input type="number" min="0" step="1" class="regular-text frm-status-field"
+                                        name="frm_gmail[accounts][__index__][filters][0][status_field_id]"
+                                        value="0"
+                                        placeholder="<?php esc_attr_e('Formidable status field ID (e.g. 7)', 'frm-gmail'); ?>">
+                                </div>
+
+                                <div class="filter-actions" style="display: block;">
+                                    <button type="button" class="button frm-test-filter" data-idx="__index__" data-fidx="0">
+                                        <?php esc_html_e('Test this filter', 'frm-gmail'); ?>
+                                    </button>
+                                    <div class="frm-gmail-test-results" id="frm-gmail-test-results-__index__-0"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <p style="margin-top:8px;">
+                            <button type="button" class="button button-secondary frm-add-filter" data-idx="__index__"><?php esc_html_e('Add filter', 'frm-gmail'); ?></button>
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </template>
+
+        <template id="frm-gmail-filter-template">
+            <div class="frm-gmail-filter" data-idx="__idx__" data-fidx="__fidx__">
+                <div class="filter-head">
+                    <strong><?php esc_html_e('Filter', 'frm-gmail'); ?> #<span class="filter-number">__num__</span></strong>
+                    <button type="button" class="button-link-delete frm-remove-filter" title="<?php esc_attr_e('Remove filter', 'frm-gmail'); ?>">✕</button>
+                </div>
+
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Parser code', 'frm-gmail'); ?></label>
+                    <input type="text" class="regular-text"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][parser_code]"
+                        placeholder="<?php esc_attr_e('e.g. UPS, DHL, AMZ, CUSTOM', 'frm-gmail'); ?>">
+                </div>
+
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Title filter', 'frm-gmail'); ?></label>
+                    <input type="text" class="regular-text"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][title_filter]"
+                        placeholder="<?php esc_attr_e('Substring to match in subject/title', 'frm-gmail'); ?>">
+                </div>
+
+                <!-- Order Id Search area BEFORE Order Id Mask -->
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Order Id Search area', 'frm-gmail'); ?></label>
+                    <select class="regular-text frm-order-id-area"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][order_id_search_area]">
+                        <option value="to"><?php esc_html_e('Email To', 'frm-gmail'); ?></option>
+                        <option value="from"><?php esc_html_e('Email From', 'frm-gmail'); ?></option>
+                        <option value="subject" selected><?php esc_html_e('Subject', 'frm-gmail'); ?></option>
+                    </select>
+                </div>
+
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Order Id Mask', 'frm-gmail'); ?></label>
+                    <input type="text" class="regular-text frm-mask"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][mask]"
+                        placeholder="<?php esc_attr_e('e.g. order-{entry_id}', 'frm-gmail'); ?>">
+                    <div class="frm-gmail-help">
+                        <?php esc_html_e('Single mask pattern. Use {entry_id} placeholder.', 'frm-gmail'); ?>
+                    </div>
+                </div>
+
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Status search area', 'frm-gmail'); ?></label>
+                    <select multiple size="2" class="regular-text frm-status-area"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][status_search_area][]">
+                        <option value="subject" selected><?php esc_html_e('subject', 'frm-gmail'); ?></option>
+                        <option value="body"><?php esc_html_e('body', 'frm-gmail'); ?></option>
+                    </select>
+                </div>
+
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Status (single string)', 'frm-gmail'); ?></label>
+                    <input type="text" class="regular-text frm-status"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][status]"
+                        placeholder="<?php esc_attr_e('e.g. Paid, Refunded, Cancelled', 'frm-gmail'); ?>">
+                </div>
+
+                <div class="frm-gmail-row">
+                    <label><?php esc_html_e('Status Field Id', 'frm-gmail'); ?></label>
+                    <input type="number" min="0" step="1" class="regular-text frm-status-field"
+                        name="frm_gmail[accounts][__idx__][filters][__fidx__][status_field_id]"
+                        value="0"
+                        placeholder="<?php esc_attr_e('Formidable status field ID (e.g. 7)', 'frm-gmail'); ?>">
+                </div>
+
+                <div class="filter-actions">
+                    <button type="button" class="button frm-test-filter" data-idx="__idx__" data-fidx="__fidx__">
+                        <?php esc_html_e('Test this filter', 'frm-gmail'); ?>
+                    </button>
+                    <div class="frm-gmail-test-results" id="frm-gmail-test-results-__idx__-__fidx__"></div>
                 </div>
             </div>
         </template>
 
         <script>
         (function(){
-            const container = document.getElementById('frm-gmail-accounts');
-            const addBtn    = document.getElementById('frm-gmail-add');
-            const template  = document.getElementById('frm-gmail-block-template').innerHTML;
+            const container   = document.getElementById('frm-gmail-accounts');
+            const addAccountBtn = document.getElementById('frm-gmail-add');
+            const accountTpl  = document.getElementById('frm-gmail-block-template').innerHTML;
+            const filterTpl   = document.getElementById('frm-gmail-filter-template').innerHTML;
+            const ajaxurl     = "<?php echo esc_js( admin_url('admin-ajax.php') ); ?>";
+            const savingUrl   = "<?php echo esc_js( admin_url('admin-post.php') ); ?>";
 
-            function reindexCards(){
+            function replaceAccountIndex(name, newIdx){
+                return name.replace(/(\[accounts\])\[\d+\]/, '$1['+newIdx+']');
+            }
+            function replaceFilterIndex(name, newFidx){
+                return name.replace(/(\[filters\])\[\d+\]/, '$1['+newFidx+']');
+            }
+
+            function reindexAccounts(){
                 const cards = container.querySelectorAll('.frm-gmail-card');
                 cards.forEach((card, idx) => {
                     card.dataset.idx = idx;
-                    card.querySelectorAll('input[name], textarea[name]').forEach(el => {
-                        el.name = el.name.replace(/\[\d+\]/, '['+idx+']');
+                    card.querySelectorAll('input[name], textarea[name], select[name]').forEach(el => {
+                        el.name = replaceAccountIndex(el.name, idx);
                     });
-                    card.querySelectorAll('[data-idx]').forEach(el => el.dataset.idx = idx);
-                });
-            }
-
-            function openPopupForIdx(idx){
-                const url = '<?php echo esc_js( admin_url('admin.php?page=' . self::MENU_SLUG) ); ?>&frm_gmail_auth=' + encodeURIComponent(idx);
-                const w = 600, h = 700;
-                const y = window.top.outerHeight/2 + window.top.screenY - ( h/2);
-                const x = window.top.outerWidth/2  + window.top.screenX - ( w/2);
-                const popup = window.open(url, 'frm_gmail_oauth_'+idx, `width=${w},height=${h},left=${x},top=${y}`);
-                window.addEventListener('message', function(ev){
-                    if (ev && ev.data && ev.data.type === 'frm_gmail_connected') {
-                        window.location.reload();
-                    }
-                });
-            }
-
-            function ensureResultsContainer(actionsRow, idx){
-                let block = actionsRow.parentElement.querySelector('.frm-gmail-test-results');
-                if (!block) {
-                    block = document.createElement('div');
-                    block.className = 'frm-gmail-test-results';
-                    block.id = 'frm-gmail-test-results-' + idx;
-                    actionsRow.insertAdjacentElement('afterend', block);
-                }
-                return block;
-            }
-
-            container.addEventListener('click', function(e){
-                const btnConnect = e.target.closest('.frm-gmail-connect');
-                if (btnConnect) {
-                    e.preventDefault();
-                    openPopupForIdx(btnConnect.dataset.idx);
-                    return;
-                }
-                const btnRemove = e.target.closest('.frm-gmail-remove');
-                if (btnRemove) {
-                    e.preventDefault();
-                    const card = btnRemove.closest('.frm-gmail-card');
-                    card.parentNode.removeChild(card);
-                    reindexCards();
-                    return;
-                }
-
-                const btnTest = e.target.closest('.frm-gmail-test');
-                if (btnTest) {
-                    e.preventDefault();
-                    const idx = btnTest.dataset.idx;
-                    const card = btnTest.closest('.frm-gmail-card');
-                    const actionsRow = card.querySelector('.frm-gmail-actions');
-                    const block = ensureResultsContainer(actionsRow, idx);
-
-                    // 1) Save current form first (AJAX), then 2) fetch test list
-                    const form = document.querySelector('.frm-gmail-form');
-                    const savingUrl = '<?php echo esc_js( admin_url('admin-post.php') ); ?>';
-                    const fd = new FormData(form);
-                    // Ensure the proper action + mark as ajax save to avoid redirect
-                    fd.set('action', '<?php echo esc_js(self::ACTION_SAVE); ?>');
-                    fd.append('frm_gmail_ajax', '1');
-
-                    // UX
-                    block.innerHTML = '<em><?php echo esc_js(__('Saving settings…', 'frm-gmail')); ?></em>';
-
-                    fetch(savingUrl, {
-                        method: 'POST',
-                        body: fd,
-                        credentials: 'same-origin'
-                    })
-                    .then(r => {
-                        // Accept 200 or 302->200 if server redirects; treat others as failure
-                        if (!r.ok) throw new Error('Save failed');
-                        return r.text(); // we don’t need the body; just consume it
-                    })
-                    .then(() => {
-                        block.innerHTML = '<em><?php echo esc_js(__('Loading latest 5 emails…', 'frm-gmail')); ?></em>';
-                        return fetch(ajaxurl + '?action=<?php echo esc_js(self::AJAX_TEST_ACTION); ?>&idx=' + encodeURIComponent(idx), {
-                            credentials: 'same-origin'
+                    card.querySelectorAll('.frm-gmail-filter').forEach((f, i) => {
+                        f.dataset.idx = idx;
+                        f.querySelectorAll('input[name], textarea[name], select[name]').forEach(el => {
+                            el.name = replaceAccountIndex(el.name, idx);
                         });
-                    })
+                        const results = f.querySelector('.frm-gmail-test-results');
+                        if (results) { results.id = 'frm-gmail-test-results-' + idx + '-' + i; }
+                        const testBtn = f.querySelector('.frm-test-filter');
+                        if (testBtn) { testBtn.dataset.idx = idx; testBtn.dataset.fidx = i; }
+                        const num = f.querySelector('.filter-number');
+                        if (num) { num.textContent = (i+1); }
+                    });
+
+                    const accountTestBtn = card.querySelector('.frm-gmail-test-account');
+                    if (accountTestBtn) accountTestBtn.dataset.idx = idx;
+
+                    const addFilterBtn = card.querySelector('.frm-add-filter');
+                    if (addFilterBtn) addFilterBtn.dataset.idx = idx;
+                });
+            }
+
+            function reindexFiltersWithin(card){
+                const idx = card.dataset.idx;
+                const filters = card.querySelectorAll('.frm-gmail-filter');
+                filters.forEach((f, i) => {
+                    f.dataset.fidx = i;
+                    f.querySelectorAll('input[name], textarea[name], select[name]').forEach(el => {
+                        el.name = replaceAccountIndex(el.name, idx);
+                        el.name = replaceFilterIndex(el.name, i);
+                    });
+                    const results = f.querySelector('.frm-gmail-test-results');
+                    if (results) { results.id = 'frm-gmail-test-results-' + idx + '-' + i; }
+                    const testBtn = f.querySelector('.frm-test-filter');
+                    if (testBtn) { testBtn.dataset.idx = idx; testBtn.dataset.fidx = i; }
+                    const num = f.querySelector('.filter-number');
+                    if (num) { num.textContent = (i+1); }
+                });
+            }
+
+            function addAccount(){
+                const idx = container.querySelectorAll('.frm-gmail-card').length;
+                const html = accountTpl.replaceAll('__index__', idx);
+                const temp = document.createElement('div');
+                temp.innerHTML = html.trim();
+                const card = temp.firstElementChild;
+                container.appendChild(card);
+                reindexAccounts();
+            }
+
+            function addFilter(card){
+                const idx = card.dataset.idx;
+                const grid = card.querySelector('.frm-gmail-filter-grid');
+                const fidx = grid.querySelectorAll('.frm-gmail-filter').length;
+                let html = filterTpl
+                    .replaceAll('__idx__', idx)
+                    .replaceAll('__fidx__', fidx)
+                    .replaceAll('__num__', (fidx+1));
+                const temp = document.createElement('div');
+                temp.innerHTML = html.trim();
+                grid.appendChild(temp.firstElementChild);
+                reindexFiltersWithin(card);
+            }
+
+            function collectFilterParams(filterEl){
+                const get = (sel)=>{ const el=filterEl.querySelector(sel); return el ? el.value : ''; };
+                const getMulti = (sel)=> {
+                    const el = filterEl.querySelector(sel);
+                    if (!el) return [];
+                    const selected = Array.from(el.options).filter(o => o.selected).map(o => o.value);
+                    return selected.length ? selected : ['subject'];
+                };
+                const getOrderArea = (sel)=>{
+                    const el = filterEl.querySelector(sel);
+                    const val = el ? el.value : 'subject';
+                    return ['to','from','subject'].includes(val) ? val : 'subject';
+                };
+                return {
+                    parser_code: get('input[name*="[parser_code]"]'),
+                    title_filter: get('input[name*="[title_filter]"]'),
+                    order_id_search_area: getOrderArea('select[name*="[order_id_search_area]"]'),
+                    mask: get('input[name*="[mask]"]'), // single value
+                    status_search_area: getMulti('select[name*="[status_search_area]"]'),
+                    status: get('input[name*="[status]"]'),
+                    status_field_id: get('input[name*="[status_field_id]"]')
+                };
+            }
+
+            function saveSettingsAJAX(){
+                const form = document.querySelector('.frm-gmail-form');
+                const fd = new FormData(form);
+                fd.set('action', '<?php echo esc_js(self::ACTION_SAVE); ?>');
+                fd.append('frm_gmail_ajax', '1');
+                return fetch(savingUrl, { method: 'POST', body: fd, credentials: 'same-origin' })
+                    .then(r => { if (!r.ok) throw new Error('Save failed'); return r.text(); });
+            }
+
+            function runAccountTest(idx, targetEl){
+                if (targetEl) targetEl.innerHTML = '<em><?php echo esc_js(__('Loading latest 5 emails…', 'frm-gmail')); ?></em>';
+                const params = new URLSearchParams({ action: '<?php echo esc_js(self::AJAX_TEST_ACTION); ?>', idx: idx });
+                return fetch(ajaxurl + '?' + params.toString(), { credentials: 'same-origin' })
                     .then(r => r.text())
-                    .then(html => { block.innerHTML = html; })
-                    .catch(err => {
-                        block.innerHTML = '<div class="frm-gmail-test-results error"><p>' +
-                            (err && err.message ? err.message : 'Error') + '</p></div>';
+                    .then(html => { if (targetEl) targetEl.innerHTML = html; });
+            }
+
+            function runFilterTest(card, filterEl){
+                const idx  = card.dataset.idx;
+                const fidx = filterEl.dataset.fidx;
+                const results = filterEl.querySelector('.frm-gmail-test-results');
+                if (results) results.innerHTML = '<em><?php echo esc_js(__('Loading latest 5 emails…', 'frm-gmail')); ?></em>';
+
+                const f = collectFilterParams(filterEl);
+                const params = new URLSearchParams({
+                    action: '<?php echo esc_js(self::AJAX_TEST_ACTION); ?>',
+                    idx: idx,
+                    fidx: fidx, // tell server this is a sub-filter test
+                    parser_code: f.parser_code || '',
+                    title_filter: f.title_filter || '',
+                    order_id_search_area: f.order_id_search_area || 'subject',
+                    mask: f.mask || '',
+                    status: f.status || '',
+                    status_field_id: f.status_field_id || ''
+                });
+                (f.status_search_area || ['subject']).forEach(v => params.append('status_search_area[]', v));
+
+                return fetch(ajaxurl + '?' + params.toString(), { credentials: 'same-origin' })
+                    .then(r => r.text())
+                    .then(html => { if (results) results.innerHTML = html; });
+            }
+
+            // Delegated events
+            container.addEventListener('click', function(e){
+                const connectBtn = e.target.closest('.frm-gmail-connect');
+                if (connectBtn) {
+                    e.preventDefault();
+                    const idx = connectBtn.dataset.idx;
+                    const url = '<?php echo esc_js( admin_url('admin.php?page=' . self::MENU_SLUG) ); ?>&frm_gmail_auth=' + encodeURIComponent(idx);
+                    const w = 600, h = 700;
+                    const y = window.top.outerHeight/2 + window.top.screenY - ( h/2);
+                    const x = window.top.outerWidth/2  + window.top.screenX - ( w/2);
+                    const popup = window.open(url, 'frm_gmail_oauth_'+idx, `width=${w},height=${h},left=${x},top=${y}`);
+                    window.addEventListener('message', function(ev){
+                        if (ev && ev.data && ev.data.type === 'frm_gmail_connected') {
+                            window.location.reload();
+                        }
                     });
                     return;
                 }
 
+                const removeAccount = e.target.closest('.frm-gmail-remove');
+                if (removeAccount) {
+                    e.preventDefault();
+                    const card = removeAccount.closest('.frm-gmail-card');
+                    card.parentNode.removeChild(card);
+                    reindexAccounts();
+                    return;
+                }
+
+                const addFilterBtn = e.target.closest('.frm-add-filter');
+                if (addFilterBtn) {
+                    e.preventDefault();
+                    const card = addFilterBtn.closest('.frm-gmail-card');
+                    addFilter(card);
+                    return;
+                }
+
+                const removeFilterBtn = e.target.closest('.frm-remove-filter');
+                if (removeFilterBtn) {
+                    e.preventDefault();
+                    const card = removeFilterBtn.closest('.frm-gmail-card');
+                    const filter = removeFilterBtn.closest('.frm-gmail-filter');
+                    filter.parentNode.removeChild(filter);
+                    reindexFiltersWithin(card);
+                    return;
+                }
+
+                const testAccountBtn = e.target.closest('.frm-gmail-test-account');
+                if (testAccountBtn) {
+                    e.preventDefault();
+                    const card = testAccountBtn.closest('.frm-gmail-card');
+                    const idx  = testAccountBtn.dataset.idx;
+                    let res = card.querySelector('.frm-gmail-test-results-account');
+                    if (!res) {
+                        res = document.createElement('div');
+                        res.className = 'frm-gmail-test-results frm-gmail-test-results-account';
+                        card.querySelector('.card-bd').appendChild(res);
+                    }
+                    res.innerHTML = '<em><?php echo esc_js(__('Saving settings…', 'frm-gmail')); ?></em>';
+                    saveSettingsAJAX()
+                        .then(() => runAccountTest(idx, res))
+                        .catch(err => { res.innerHTML = '<div class="frm-gmail-test-results error"><p>' + (err?.message || 'Error') + '</p></div>'; });
+                    return;
+                }
+
+                const testFilterBtn = e.target.closest('.frm-test-filter');
+                if (testFilterBtn) {
+                    e.preventDefault();
+                    const card   = testFilterBtn.closest('.frm-gmail-card');
+                    const filter = testFilterBtn.closest('.frm-gmail-filter');
+                    const results= filter.querySelector('.frm-gmail-test-results');
+                    if (results) results.innerHTML = '<em><?php echo esc_js(__('Saving settings…', 'frm-gmail')); ?></em>';
+
+                    // Save the current settings, then run test strictly with this block’s params
+                    saveSettingsAJAX()
+                        .then(() => runFilterTest(card, filter))
+                        .catch(err => {
+                            if (results) results.innerHTML = '<div class="frm-gmail-test-results error"><p>' + (err?.message || 'Error') + '</p></div>';
+                        });
+                    return;
+                }
             });
 
-            if (addBtn) {
-                addBtn.addEventListener('click', function(){
-                    const idx = container.querySelectorAll('.frm-gmail-card').length;
-                    const html = template.replaceAll('__index__', idx);
-                    const temp = document.createElement('div');
-                    temp.innerHTML = html.trim();
-                    container.appendChild(temp.firstElementChild);
-                    reindexCards();
+            if (addAccountBtn) {
+                addAccountBtn.addEventListener('click', function(e){
+                    e.preventDefault();
+                    addAccount();
                 });
             }
         })();
         </script>
         <?php
-        // ——— END PAGE HTML ———
     }
 
     /** Start OAuth for a given account index (called from admin page via popup) */
@@ -668,7 +1059,6 @@ final class FrmGmailAdminPage {
         if ($email) {
             FrmGmailParserHelper::setConnectedEmailAndTime($idx, $email);
         } else {
-            // still store connected_at
             FrmGmailParserHelper::setConnectedEmailAndTime($idx, '');
         }
 
@@ -676,12 +1066,93 @@ final class FrmGmailAdminPage {
         exit;
     }
 
-    /** Admin AJAX → call parser to render the HTML and echo it */
+    /**
+     * Admin AJAX → call parser to render the HTML and echo it.
+     * Accepts optional filter params (parser_code, title_filter, order_id_search_area, mask, status_search_area[], status, status_field_id)
+     * If none provided, returns generic latest emails for the account.
+     * Normalizes `status` (single string) → `statuses[]`.
+     * Defaults status_search_area to ['subject'] if none provided.
+     * IMPORTANT: If `fidx` is present, ONLY use params from this request (no fallback to saved settings).
+     */
     public static function ajax_test_list(): void {
         if ( ! current_user_can(self::CAPABILITY) ) { wp_die('Forbidden'); }
 
-        $idx = isset($_GET['idx']) ? (int) $_GET['idx'] : -1;
-        $html = FrmGmailParser::renderTestListHtml($idx, self::oauth_redirect_uri());
+        $idx  = isset($_GET['idx'])  ? (int) $_GET['idx']  : -1;
+        $fidx = isset($_GET['fidx']) ? (int) $_GET['fidx'] : null; // which sub-filter (optional)
+
+        // Collect sub parameters
+        $filters = [
+            'parser_code'           => isset($_GET['parser_code']) ? sanitize_text_field((string) $_GET['parser_code']) : '',
+            'title_filter'          => isset($_GET['title_filter']) ? sanitize_text_field((string) $_GET['title_filter']) : '',
+            'order_id_search_area'  => 'subject',
+            'mask'                  => isset($_GET['mask']) ? sanitize_text_field((string) $_GET['mask']) : '',
+            'status'                => isset($_GET['status']) ? sanitize_text_field((string) $_GET['status']) : '',
+            'status_field_id'       => isset($_GET['status_field_id']) ? absint((string) $_GET['status_field_id']) : 0,
+            'status_search_area'    => [],
+        ];
+
+        if ( isset($_GET['order_id_search_area']) ) {
+            $o = sanitize_text_field((string) $_GET['order_id_search_area']);
+            if (in_array($o, ['to','from','subject'], true)) {
+                $filters['order_id_search_area'] = $o;
+            }
+        }
+
+        if ( isset($_GET['status_search_area']) ) {
+            $areas = (array) $_GET['status_search_area'];
+            foreach ($areas as $a) {
+                $a = sanitize_text_field($a);
+                if (in_array($a, ['body','subject'], true)) {
+                    $filters['status_search_area'][] = $a;
+                }
+            }
+        }
+
+        // Default to subject if none selected
+        if (empty($filters['status_search_area'])) {
+            $filters['status_search_area'] = ['subject'];
+        }
+
+        // Build statuses[] strictly from GET when fidx present; otherwise allow account-level fallback
+        $statuses_raw = '';
+        if ( isset($_GET['statuses']) ) {
+            $statuses_raw = (string) $_GET['statuses']; // comma/newline supported (legacy)
+        } elseif ( $filters['status'] !== '' ) {
+            $statuses_raw = $filters['status'];
+        }
+
+        $statuses = [];
+        if ($statuses_raw !== '') {
+            $parts = preg_split('/[\n,]+/', $statuses_raw);
+            $parts = array_map('trim', $parts);
+            $statuses = array_values(array_filter($parts, static function($s){ return $s !== ''; }));
+        }
+
+        if (empty($statuses) && $fidx === null) {
+            $settings = FrmGmailParserHelper::getSettings();
+            if ( isset($settings['accounts'][$idx]) ) {
+                $acc = $settings['accounts'][$idx];
+                if (empty($statuses) && !empty($acc['statuses'])) {
+                    $raw = (string) $acc['statuses'];
+                    $parts = preg_split('/[\n,]+/', $raw);
+                    $parts = array_map('trim', $parts);
+                    $statuses = array_values(array_filter($parts, static function($s){ return $s !== ''; }));
+                }
+            }
+        }
+
+        $filters['statuses'] = $statuses;
+
+        if ($fidx !== null) {
+            $filters['fidx'] = $fidx; // forward for the parser if it cares
+        }
+
+        if (method_exists('FrmGmailParser', 'renderTestListHtml')) {
+            $html = FrmGmailParser::renderTestListHtml($idx, self::oauth_redirect_uri(), $filters);
+        } else {
+            $html = '<div class="frm-gmail-test-results error"><p>Parser method missing.</p></div>';
+        }
+
         wp_die($html);
     }
 }
