@@ -27,6 +27,7 @@ class FrmGmailInit {
     private function include_settings() {
 
         require_once FRM_GML_BASE_URL.'/classes/admin/FrmGmailAdminPage.php';
+        require_once FRM_GML_BASE_URL.'/classes/admin/FrmGmailMessagesPage.php';
 
     }
 
