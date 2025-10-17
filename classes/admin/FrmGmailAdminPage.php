@@ -142,6 +142,8 @@ final class FrmGmailAdminPage {
                 // General (always present)
                 $title       = isset($row['title']) ? sanitize_text_field($row['title']) : '';
                 $credentials = isset($row['credentials']) ? FrmGmailParserHelper::sanitizeTextareaKeepJson($row['credentials']) : '';
+                $archive_entries = !empty($row['archive_entries']) ? 1 : 0;
+                $active_cron     = !empty($row['active_cron']) ? 1 : 0;
     
                 // Filters (array of sub-blocks)
                 $filters_in  = isset($row['filters']) && is_array($row['filters']) ? $row['filters'] : [];
@@ -242,6 +244,8 @@ final class FrmGmailAdminPage {
                 $new = [
                     'title'       => $title,
                     'credentials' => $credentials,
+                    'archive_entries' => $archive_entries,  
+                    'active_cron'     => $active_cron,
                     'filters'     => array_values($filters_out),
                 ];
     
@@ -344,17 +348,17 @@ final class FrmGmailAdminPage {
             .frm-gmail-filter .filter-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
             .frm-gmail-filter .filter-head strong{font-size:13px}
             /* Light-green “Test this filter” button */
-.button.frm-test-filter {
-  background: #eaffea;
-  border-color: #8bd48b;
-  color: #1f6f1f;
-}
-.button.frm-test-filter:hover,
-.button.frm-test-filter:focus {
-  background: #d9ffd9;
-  border-color: #6bc76b;
-  color: #145c14;
-}
+            .button.frm-test-filter {
+            background: #eaffea;
+            border-color: #8bd48b;
+            color: #1f6f1f;
+            }
+            .button.frm-test-filter:hover,
+            .button.frm-test-filter:focus {
+            background: #d9ffd9;
+            border-color: #6bc76b;
+            color: #145c14;
+            }
 
             @media (max-width: 1100px){ .frm-gmail-card{flex:1 1 100%} .frm-gmail-top-grid{grid-template-columns:1fr} }
         </style>
@@ -416,6 +420,8 @@ final class FrmGmailAdminPage {
                 foreach ( $rows as $i => $row ):
                     $title        = $row['title']            ?? '';
                     $credentials  = $row['credentials']      ?? '';
+                    $archive_entries = !empty($row['archive_entries']);
+                    $active_cron     = !empty($row['active_cron']);
                     $filters      = isset($row['filters']) && is_array($row['filters']) ? $row['filters'] : [[]];
 
                     $token       = $row['token']            ?? null;
@@ -449,6 +455,26 @@ final class FrmGmailAdminPage {
                                 <div class="frm-gmail-help">
                                     <?php esc_html_e('Paste either minimal {"client_id","client_secret"} or the full "web" JSON from Google Cloud. We unslash & keep raw JSON; refresh tokens will be stored here after Connect.', 'frm-gmail'); ?>
                                 </div>
+                            </div>
+
+                            <div class="frm-gmail-row">
+                                <label>
+                                    <input type="checkbox"
+                                        name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][archive_entries]"
+                                        value="1" <?php checked( $archive_entries ); ?> />
+                                    <?php esc_html_e('Archive entries (after update)', 'frm-gmail'); ?>
+                                </label>
+                                <p class="frm-gmail-help"><?php esc_html_e('If enabled, entries will be archived after a successful status update.', 'frm-gmail'); ?></p>
+                            </div>
+
+                            <div class="frm-gmail-row">
+                                <label>
+                                    <input type="checkbox"
+                                        name="frm_gmail[accounts][<?php echo esc_attr($i); ?>][active_cron]"
+                                        value="1" <?php checked( $active_cron ); ?> />
+                                    <?php esc_html_e('Active Cron', 'frm-gmail'); ?>
+                                </label>
+                                <p class="frm-gmail-help"><?php esc_html_e('Enable scheduled parsing/updating via WP-Cron.', 'frm-gmail'); ?></p>
                             </div>
 
                             <!-- Button block (after Credentials) -->
@@ -683,6 +709,26 @@ final class FrmGmailAdminPage {
                         <div class="frm-gmail-help">
                             <?php esc_html_e('We will unslash and keep raw JSON.', 'frm-gmail'); ?>
                         </div>
+                    </div>
+
+                    <div class="frm-gmail-row">
+                        <label>
+                            <input type="checkbox"
+                                name="frm_gmail[accounts][__index__][archive_entries]"
+                                value="1" />
+                            Archive entries (after update)
+                        </label>
+                        <p class="frm-gmail-help">If enabled, entries will be archived after a successful status update.</p>
+                        </div>
+
+                        <div class="frm-gmail-row">
+                        <label>
+                            <input type="checkbox"
+                                name="frm_gmail[accounts][__index__][active_cron]"
+                                value="1" />
+                            Active Cron
+                        </label>
+                        <p class="frm-gmail-help">Enable scheduled parsing/updating via WP-Cron.</p>
                     </div>
 
                     <!-- Button block -->
