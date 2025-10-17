@@ -16,7 +16,7 @@ if ( ! defined('ABSPATH') ) { exit; }
  * - "Status (single string)" accepts comma-separated and/or newline-separated values
  *   (e.g. "Paid, Refunded, Cancelled") → we search for ANY (OR) of them.
  *
- * - Extra fields: multiple blocks with (title, code, mask, search_area=subject|body, entry_field_id)
+ * - Extra fields: multiple blocks with (title, code, mask, search_area=subject|body|body_text|body_html, entry_field_id)
  *   Mask uses {value} placeholder. We extract value from the chosen area and return per message.
  */
 final class FrmGmailParser {
@@ -57,14 +57,16 @@ final class FrmGmailParser {
     }
 
     /** Extract all extras for a given message based on compiled masks and areas. */
-    private static function extractExtras(array $extraFields, string $subject, string $body): array {
+    private static function extractExtras(array $extraFields, string $subject, string $bodyText, string $bodyHtml): array {
         $out = [];
         foreach ($extraFields as $ef) {
-            $title  = trim((string)($ef['title'] ?? ''));
-            $code   = trim((string)($ef['code'] ?? ''));
-            $mask   = (string)($ef['mask'] ?? '');
-            $area   = in_array(($ef['search_area'] ?? 'subject'), ['subject','body'], true) ? $ef['search_area'] : 'subject';
-            $fieldId= (int)($ef['entry_field_id'] ?? 0);
+            $title   = trim((string)($ef['title'] ?? ''));
+            $code    = trim((string)($ef['code'] ?? ''));
+            $mask    = (string)($ef['mask'] ?? '');
+            // Support: subject | body | body_text | body_html
+            $areaRaw = (string)($ef['search_area'] ?? 'subject');
+            $area    = in_array($areaRaw, ['subject','body','body_text','body_html'], true) ? $areaRaw : 'subject';
+            $fieldId = (int)($ef['entry_field_id'] ?? 0);
 
             if ($mask === '') {
                 $out[] = [
@@ -87,13 +89,28 @@ final class FrmGmailParser {
                 continue;
             }
 
-            $haystack = ($area === 'body') ? $body : $subject;
+            // Decide haystack(s)
+            $haystacks = [];
+            if ($area === 'subject') {
+                $haystacks = [$subject];
+            } elseif ($area === 'body_text') {
+                $haystacks = [$bodyText];
+            } elseif ($area === 'body_html') {
+                $haystacks = [$bodyHtml];
+            } else /* 'body' (legacy general body) */ {
+                // Try text first, then raw HTML
+                $haystacks = [$bodyText, $bodyHtml];
+            }
+
             $value = '';
-            if ($haystack !== '' && preg_match($rx, $haystack, $m)) {
-                $value = isset($m['value']) ? trim($m['value']) : '';
-                // If matcher is too greedy, shrink to the first line sensibly.
-                if (strpos($value, "\n") !== false) {
-                    $value = trim(preg_split('/\R/', $value, 2)[0]);
+            foreach ($haystacks as $hs) {
+                if ($hs !== '' && preg_match($rx, $hs, $m)) {
+                    $value = isset($m['value']) ? trim($m['value']) : '';
+                    // If matcher is too greedy, shrink to the first line sensibly.
+                    if (strpos($value, "\n") !== false) {
+                        $value = trim(preg_split('/\R/', $value, 2)[0]);
+                    }
+                    break;
                 }
             }
 
@@ -123,7 +140,7 @@ final class FrmGmailParser {
                     'title'          => (string)($ef['title'] ?? ''),
                     'code'           => (string)($ef['code'] ?? ''),
                     'mask'           => (string)($ef['mask'] ?? ''),
-                    'search_area'    => in_array(($ef['search_area'] ?? 'subject'), ['subject','body'], true) ? $ef['search_area'] : 'subject',
+                    'search_area'    => in_array(($ef['search_area'] ?? 'subject'), ['subject','body','body_text','body_html'], true) ? $ef['search_area'] : 'subject',
                     'entry_field_id' => (int)($ef['entry_field_id'] ?? 0),
                 ];
             }
@@ -141,7 +158,7 @@ final class FrmGmailParser {
                         'title'          => (string)($ef['title'] ?? ''),
                         'code'           => (string)($ef['code'] ?? ''),
                         'mask'           => (string)($ef['mask'] ?? ''),
-                        'search_area'    => in_array(($ef['search_area'] ?? 'subject'), ['subject','body'], true) ? $ef['search_area'] : 'subject',
+                        'search_area'    => in_array(($ef['search_area'] ?? 'subject'), ['subject','body','body_text','body_html'], true) ? $ef['search_area'] : 'subject',
                         'entry_field_id' => (int)($ef['entry_field_id'] ?? 0),
                     ];
                 }
@@ -210,29 +227,32 @@ final class FrmGmailParser {
         }
     }
 
-    private static function extractPlainBody(\Google\Service\Gmail\Message $msg): string {
+    /** Return both plain text and raw HTML bodies (joined across parts). */
+    private static function extractBodies(\Google\Service\Gmail\Message $msg): array {
         $payload = $msg->getPayload();
-        if (!$payload) { return ''; }
+        if (!$payload) { return ['text' => '', 'html' => '']; }
 
         $plain = [];
         self::collectPartsByMime($payload, 'text/plain', $plain);
+
+        $htmlParts = [];
+        self::collectPartsByMime($payload, 'text/html', $htmlParts);
+
+        $text = '';
         if (!empty($plain)) {
-            return trim(implode("\n\n", $plain));
+            $text = trim(implode("\n\n", $plain));
+        } elseif (!empty($htmlParts)) {
+            // Fallback: strip HTML to text
+            $joined = trim(implode("\n\n", $htmlParts));
+            $text   = trim(html_entity_decode(wp_strip_all_tags($joined, true), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        } elseif ($payload->getBody() && $payload->getBody()->getSize() > 0) {
+            $raw  = $payload->getBody()->getData() ?? '';
+            $text = trim(self::b64url_decode($raw));
         }
 
-        $html = [];
-        self::collectPartsByMime($payload, 'text/html', $html);
-        if (!empty($html)) {
-            $joined = trim(implode("\n\n", $html));
-            $text = wp_strip_all_tags($joined, true);
-            return trim(html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        }
+        $html = !empty($htmlParts) ? trim(implode("\n\n", $htmlParts)) : '';
 
-        if ($payload->getBody() && $payload->getBody()->getSize() > 0) {
-            $raw = $payload->getBody()->getData() ?? '';
-            return trim(self::b64url_decode($raw));
-        }
-        return '';
+        return ['text' => $text, 'html' => $html];
     }
 
     /** Normalize statuses from either array or comma/newline string. */
@@ -271,7 +291,7 @@ final class FrmGmailParser {
      *                          - mask: string (single pattern; may include {entry_id})
      *                          - title_filter: string (subject substring; INCLUDED IN API QUERY)
      *                          - fidx: int (to resolve saved extra_fields)
-     *                          - extra_fields: array (override with explicit extra field blocks)
+     *                          - extra_fields: array (explicit blocks)
      *
      * @return array { items: array<array>, error: ?string }
      */
@@ -367,8 +387,10 @@ final class FrmGmailParser {
                     $toHeader    = $headers['To'] ?? $deliveredTo;
                     $subject     = $headers['Subject'] ?? '';
 
-                    // Body
-                    $body = self::extractPlainBody($msg);
+                    // Body (both text and html)
+                    $bodies   = self::extractBodies($msg);
+                    $bodyText = (string)($bodies['text'] ?? '');
+                    $bodyHtml = (string)($bodies['html'] ?? '');
 
                     // ---- Title filter safeguard (should already be in API query) ----
                     if ($titleFilter !== '' && stripos($subject, $titleFilter) === false) {
@@ -397,8 +419,11 @@ final class FrmGmailParser {
                         if (in_array('subject', $statusAreas, true) && preg_match($rx, $subject)) {
                             $hit = true;
                         }
-                        if (!$hit && in_array('body', $statusAreas, true) && $body !== '' && preg_match($rx, $body)) {
-                            $hit = true;
+                        if (!$hit && in_array('body', $statusAreas, true)) {
+                            // try plain text, then raw HTML
+                            if (($bodyText !== '' && preg_match($rx, $bodyText)) || ($bodyHtml !== '' && preg_match($rx, $bodyHtml))) {
+                                $hit = true;
+                            }
                         }
                         if ($hit) { $matchedStatus = $statuses[$i]; break; }
                     }
@@ -406,7 +431,7 @@ final class FrmGmailParser {
                     // ---- Extra fields (extract per configured masks/areas) ----
                     $extras = [];
                     if (!empty($extraFields)) {
-                        $extras = self::extractExtras($extraFields, $subject, $body);
+                        $extras = self::extractExtras($extraFields, $subject, $bodyText, $bodyHtml);
                     }
 
                     $items[] = [
@@ -416,8 +441,8 @@ final class FrmGmailParser {
                         'subject'     => $subject,
                         'status'      => $matchedStatus,
                         'entryId'     => $entryId,
-                        'body'        => $body,
-                        'extras'      => $extras, // <<—— included
+                        'body'        => $bodyText, // keep text for UI snippet
+                        'extras'      => $extras,
                     ];
                 }
 
