@@ -15,6 +15,9 @@ if ( ! defined('ABSPATH') ) { exit; }
  *
  * - "Status (single string)" accepts comma-separated and/or newline-separated values
  *   (e.g. "Paid, Refunded, Cancelled") → we search for ANY (OR) of them.
+ *
+ * - Extra fields: multiple blocks with (title, code, mask, search_area=subject|body, entry_field_id)
+ *   Mask uses {value} placeholder. We extract value from the chosen area and return per message.
  */
 final class FrmGmailParser {
 
@@ -33,6 +36,120 @@ final class FrmGmailParser {
         $regex = '/'.$pat.'/i';
 
         return ['raw' => $mask, 'prefix' => $prefix, 'regex' => $regex];
+    }
+
+    /** Compile an extra field's mask: {value} → (?P<value>.+?) (non-greedy; single-line), fallback capture if missing. */
+    private static function compileExtraMask(string $mask): ?string {
+        $mask = trim($mask);
+        if ($mask === '') { return null; }
+        $pat = preg_quote($mask, '/');
+
+        if (strpos($mask, '{value}') !== false) {
+            $pat = str_replace('\{value\}', '(?P<value>.+?)', $pat);
+        } else {
+            // If no {value} given, capture the whole tail at the end to "some value"
+            // e.g. "Your code: " → "Your code: (?P<value>.+?)"
+            $pat .= '(?P<value>.+?)';
+        }
+
+        // Use 's' to let dot match newlines, and 'i' for case-insensitive
+        return '/'.$pat.'/is';
+    }
+
+    /** Extract all extras for a given message based on compiled masks and areas. */
+    private static function extractExtras(array $extraFields, string $subject, string $body): array {
+        $out = [];
+        foreach ($extraFields as $ef) {
+            $title  = trim((string)($ef['title'] ?? ''));
+            $code   = trim((string)($ef['code'] ?? ''));
+            $mask   = (string)($ef['mask'] ?? '');
+            $area   = in_array(($ef['search_area'] ?? 'subject'), ['subject','body'], true) ? $ef['search_area'] : 'subject';
+            $fieldId= (int)($ef['entry_field_id'] ?? 0);
+
+            if ($mask === '') {
+                $out[] = [
+                    'title'          => $title,
+                    'code'           => $code,
+                    'value'          => '',
+                    'entry_field_id' => $fieldId,
+                ];
+                continue;
+            }
+
+            $rx = self::compileExtraMask($mask);
+            if (!$rx) {
+                $out[] = [
+                    'title'          => $title,
+                    'code'           => $code,
+                    'value'          => '',
+                    'entry_field_id' => $fieldId,
+                ];
+                continue;
+            }
+
+            $haystack = ($area === 'body') ? $body : $subject;
+            $value = '';
+            if ($haystack !== '' && preg_match($rx, $haystack, $m)) {
+                $value = isset($m['value']) ? trim($m['value']) : '';
+                // If matcher is too greedy, shrink to the first line sensibly.
+                if (strpos($value, "\n") !== false) {
+                    $value = trim(preg_split('/\R/', $value, 2)[0]);
+                }
+            }
+
+            $out[] = [
+                'title'          => $title,
+                'code'           => $code,
+                'value'          => $value,
+                'entry_field_id' => $fieldId,
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Resolve extra_fields for current call:
+     * 1) If $opts['extra_fields'] provided (AJAX test overrides) → use it.
+     * 2) Else, if $opts['fidx'] provided, load from saved settings for that filter.
+     * 3) Else return [].
+     */
+    private static function resolveExtrasForCall(int $idx, array $opts): array {
+        if (!empty($opts['extra_fields']) && is_array($opts['extra_fields'])) {
+            // sanitize shape quickly
+            $clean = [];
+            foreach ($opts['extra_fields'] as $ef) {
+                if (!is_array($ef)) { continue; }
+                $clean[] = [
+                    'title'          => (string)($ef['title'] ?? ''),
+                    'code'           => (string)($ef['code'] ?? ''),
+                    'mask'           => (string)($ef['mask'] ?? ''),
+                    'search_area'    => in_array(($ef['search_area'] ?? 'subject'), ['subject','body'], true) ? $ef['search_area'] : 'subject',
+                    'entry_field_id' => (int)($ef['entry_field_id'] ?? 0),
+                ];
+            }
+            return $clean;
+        }
+
+        if (isset($opts['fidx'])) {
+            $fidx = (int) $opts['fidx'];
+            $acc  = FrmGmailParserHelper::getAccount($idx);
+            if ($acc && !empty($acc['filters'][$fidx]['extra_fields']) && is_array($acc['filters'][$fidx]['extra_fields'])) {
+                $extra = $acc['filters'][$fidx]['extra_fields'];
+                $clean = [];
+                foreach ($extra as $ef) {
+                    $clean[] = [
+                        'title'          => (string)($ef['title'] ?? ''),
+                        'code'           => (string)($ef['code'] ?? ''),
+                        'mask'           => (string)($ef['mask'] ?? ''),
+                        'search_area'    => in_array(($ef['search_area'] ?? 'subject'), ['subject','body'], true) ? $ef['search_area'] : 'subject',
+                        'entry_field_id' => (int)($ef['entry_field_id'] ?? 0),
+                    ];
+                }
+                return $clean;
+            }
+        }
+
+        return [];
     }
 
     /**
@@ -153,6 +270,8 @@ final class FrmGmailParser {
      *                          - order_id_search_area: 'to'|'from'|'subject' (default 'subject')
      *                          - mask: string (single pattern; may include {entry_id})
      *                          - title_filter: string (subject substring; INCLUDED IN API QUERY)
+     *                          - fidx: int (to resolve saved extra_fields)
+     *                          - extra_fields: array (override with explicit extra field blocks)
      *
      * @return array { items: array<array>, error: ?string }
      */
@@ -184,6 +303,9 @@ final class FrmGmailParser {
         $maskCompiled = self::parseOrderIdMask($maskText); // single or null
 
         $titleFilter  = isset($opts['title_filter']) ? trim((string)$opts['title_filter']) : '';
+
+        // ---- resolve extras for this call (may be empty) ----
+        $extraFields = self::resolveExtrasForCall($idx, $opts);
 
         if (empty($statuses)) {
             return ['items' => [], 'error' => 'Please add at least one Status to test.'];
@@ -281,6 +403,12 @@ final class FrmGmailParser {
                         if ($hit) { $matchedStatus = $statuses[$i]; break; }
                     }
 
+                    // ---- Extra fields (extract per configured masks/areas) ----
+                    $extras = [];
+                    if (!empty($extraFields)) {
+                        $extras = self::extractExtras($extraFields, $subject, $body);
+                    }
+
                     $items[] = [
                         'id'          => $m->getId(),
                         'from'        => $from,
@@ -289,6 +417,7 @@ final class FrmGmailParser {
                         'status'      => $matchedStatus,
                         'entryId'     => $entryId,
                         'body'        => $body,
+                        'extras'      => $extras, // <<—— included
                     ];
                 }
 
@@ -304,7 +433,7 @@ final class FrmGmailParser {
 
     /**
      * Render the small preview block (uses getAllMessages()).
-     * Shows up to 5 items, including the body snippet.
+     * Shows up to 5 items, including the body snippet and EXTRA FIELDS (if configured).
      *
      * @param int         $idx
      * @param string      $oauthRedirectUri (kept for signature compatibility)
@@ -315,6 +444,8 @@ final class FrmGmailParser {
      *                             - status_search_area (['subject','body'])
      *                             - status (single string; comma/newline OK) or statuses (array)
      *                             - parser_code, status_field_id (ignored here)
+     *                             - fidx (to load saved extra_fields)
+     *                             - extra_fields (explicit blocks)
      */
     public static function renderTestListHtml(int $idx, string $oauthRedirectUri, array $filters = []): string {
         if ( ! current_user_can(FrmGmailParserHelper::CAPABILITY) ) {
@@ -338,6 +469,12 @@ final class FrmGmailParser {
         } elseif (isset($filters['status'])) {
             // can be "Paid, Refunded, Cancelled"
             $opts['status'] = (string)$filters['status'];
+        }
+
+        // Pass through fidx & extra_fields if present (so getAllMessages can resolve/save-based extras)
+        if (isset($filters['fidx']))         { $opts['fidx'] = (int)$filters['fidx']; }
+        if (!empty($filters['extra_fields']) && is_array($filters['extra_fields'])) {
+            $opts['extra_fields'] = $filters['extra_fields'];
         }
 
         $result = self::getAllMessages($idx, 500, 3, $opts);
@@ -367,6 +504,19 @@ final class FrmGmailParser {
                 echo '<div class="to">'. esc_html__('Delivered-To: ', 'frm-gmail'). esc_html($row['deliveredTo']) .'</div>';
                 echo '<div class="status">'. esc_html__('Status: ', 'frm-gmail') . '<strong>' . esc_html($row['status'] ?: __('(not found)', 'frm-gmail')) . '</strong></div>';
                 echo '<div class="status">'. esc_html__('Entry ID: ', 'frm-gmail') . '<strong>' . esc_html($row['entryId'] ?: __('(not found)', 'frm-gmail')) . '</strong></div>';
+
+                // Extra fields (if present)
+                if (!empty($row['extras'])) {
+                    echo '<div class="extras"><strong>'. esc_html__('Extra fields:', 'frm-gmail') .'</strong><br>';
+                    echo '<ul style="margin:6px 0 0 16px;">';
+                    foreach ($row['extras'] as $ef) {
+                        $label = $ef['title'] !== '' ? $ef['title'] : ($ef['code'] !== '' ? $ef['code'] : __('(unnamed)', 'frm-gmail'));
+                        $val   = (string)($ef['value'] ?? '');
+                        echo '<li><em>'. esc_html($label) .'</em>: '. esc_html($val !== '' ? $val : __('(not found)', 'frm-gmail')) .'</li>';
+                    }
+                    echo '</ul></div>';
+                }
+
                 echo '<div class="body"><strong>'. esc_html__('Body:', 'frm-gmail') .'</strong><br>' . nl2br(esc_html($snippet)) . $more . '</div>';
                 echo '</div>';
             }
