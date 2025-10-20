@@ -303,7 +303,13 @@ final class FrmGmailParser {
 
         $creds     = $row['credentials'] ?? '';
         $token     = $row['token']       ?? null;
-        $startDate = FrmGmailParserHelper::getStartDate();
+
+        // Flexible start date
+        if( isset($opts['start_date']) && $opts['start_date'] != '' ) {
+            $startDate = $opts['start_date'];
+        } else {
+            $startDate = FrmGmailParserHelper::getStartDate();
+        }
 
         // ---- statuses (now supports comma-separated in single string) ----
         $statuses = self::normalizeStatuses($opts, $idx);
