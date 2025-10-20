@@ -18,12 +18,10 @@ class FrmGmailEntryHelper {
     public static function updateEntryMeta(int $entry_id, int $field_id, $value): bool {
         
         // Prefer Formidable API if present (it handles caching/serialization).
-        if ( class_exists('FrmEntryMeta') ) {
-            // FrmEntryMeta::update_entry_meta() upserts internally,
-            // but we keep the "exists or create" semantics required.
+        /*if ( class_exists('FrmEntryMeta') ) {
             $updated = \FrmEntryMeta::update_entry_meta($entry_id, $field_id, null, $value);
             return (bool) $updated;
-        }
+        }*/
 
         // Direct DB fallback
         global $wpdb;
@@ -62,6 +60,37 @@ class FrmGmailEntryHelper {
             return $res !== false && (int)$wpdb->insert_id > 0;
         }
     }
+
+    public static function forceEntryUpdate(int $entryId): void {
+        
+        $entry = FrmEntry::getOne( $entryId, true );
+        if ( ! $entry ) { return; }
+
+        $metas = $entry->metas;
+
+        // Trigger Formidable update hooks
+        do_action( 'frm_update_entry', $entryId, $entry->form_id, $metas );
+        do_action( 'frm_after_update_entry', $entryId, $entry->form_id, $metas );
+
+    }
+
+    public static function cleanCronValues(): void {
+        global $wpdb;
+    
+        $prefix = $wpdb->esc_like('gmail_last_date_update_') . '%';
+        $options = $wpdb->get_col(
+            $wpdb->prepare("SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s", $prefix)
+        );
+    
+        if (empty($options)) {
+            return;
+        }
+    
+        foreach ($options as $opt) {
+            delete_option($opt);
+        }
+    }    
+
 }
 
     
