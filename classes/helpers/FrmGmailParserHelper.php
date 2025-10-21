@@ -139,6 +139,113 @@ final class FrmGmailParserHelper {
     }
 
     /**
+     * Fetch a single Gmail message by ID for a given account + filter, using the same
+     * parser options (statuses + extra_fields) as getMessagesByAccountFilter().
+     *
+     * @return array{
+     *   item: ?array,
+     *   error: ?string,
+     *   meta: array{ idx:int, filter_index:int, parser_code:string, statusFieldId:int, message_id:string }
+     * }
+     */
+    public static function getMessageById(int $idx, int $filterIndex, string $messageId, array $options = []): array {
+        $account = self::getAccount($idx);
+        if (!$account) {
+            return [
+                'item' => null,
+                'error' => 'Account not found.',
+                'meta'  => ['idx'=>$idx,'filter_index'=>$filterIndex,'parser_code'=>'','statusFieldId'=>0,'message_id'=>$messageId],
+            ];
+        }
+
+        $filters = isset($account['filters']) && is_array($account['filters']) ? $account['filters'] : [];
+        if (!isset($filters[$filterIndex]) || !is_array($filters[$filterIndex])) {
+            return [
+                'item' => null,
+                'error' => 'Filter not found.',
+                'meta'  => ['idx'=>$idx,'filter_index'=>$filterIndex,'parser_code'=>'','statusFieldId'=>0,'message_id'=>$messageId],
+            ];
+        }
+
+        $filter        = $filters[$filterIndex];
+        $statusFieldId = isset($filter['status_field_id']) ? (int)$filter['status_field_id'] : 0;
+        $parserCode    = isset($filter['parser_code']) ? (string)$filter['parser_code'] : '';
+
+        // Build the same parser options you use elsewhere
+        $opts = self::buildParserOptsFromFilter($filter);
+        $opts['fidx'] = $filterIndex;
+
+        // Optional global or explicit start_date
+        if (!empty($options['start_date'])) {
+            $opts['start_date'] = (string)$options['start_date'];
+        } else {
+            $globalStart = self::getStartDate();
+            if (!empty($globalStart)) {
+                $opts['start_date'] = $globalStart;
+            }
+        }
+
+        // Hint the parser to restrict to a single message
+        $opts['message_id'] = $messageId;
+        $opts['ids']        = [$messageId];
+
+        // Try a dedicated single-message method if present; otherwise fallback
+        $res = null;
+        if (method_exists('FrmGmailParser', 'getSingleMessage')) {
+            $res = FrmGmailParser::getSingleMessage($idx, $messageId, $opts);
+            // Expected to return ['item'=>..., 'error'=>...?] or a single-item list
+            if (is_array($res) && array_key_exists('item', $res)) {
+                $item  = is_array($res['item'] ?? null) ? $res['item'] : null;
+                $error = !empty($res['error']) ? (string)$res['error'] : null;
+                return [
+                    'item' => $item,
+                    'error'=> $error,
+                    'meta' => [
+                        'idx' => $idx,
+                        'filter_index' => $filterIndex,
+                        'parser_code' => $parserCode,
+                        'statusFieldId' => $statusFieldId,
+                        'message_id' => $messageId,
+                    ],
+                ];
+            }
+        }
+
+        // Fallback: call getAllMessages with the message filter and take the first matched item
+        $all = FrmGmailParser::getAllMessages($idx, 1, 1, $opts);
+        $item  = null;
+        $error = null;
+
+        if (!empty($all['error'])) {
+            $error = (string)$all['error'];
+        } else {
+            $items = is_array($all['items'] ?? null) ? $all['items'] : [];
+            if (!empty($items)) {
+                // Prefer exact ID match if present
+                foreach ($items as $row) {
+                    $rid = (string)($row['id'] ?? ($row['message_id'] ?? ($row['gmailId'] ?? '')));
+                    if ($rid === $messageId) { $item = $row; break; }
+                }
+                if (!$item) { $item = $items[0]; }
+            } else {
+                $error = 'Message not found or did not match the filter.';
+            }
+        }
+
+        return [
+            'item' => $item,
+            'error'=> $error,
+            'meta' => [
+                'idx' => $idx,
+                'filter_index' => $filterIndex,
+                'parser_code' => $parserCode,
+                'statusFieldId' => $statusFieldId,
+                'message_id' => $messageId,
+            ],
+        ];
+    }
+
+    /**
      * Get all messages for **all filters** of a single account.
      * Replaces old getAllMessageAccounts() which aggregated across accounts.
      *
@@ -387,6 +494,128 @@ final class FrmGmailParserHelper {
 
         return $summary;
     }
+
+    /**
+     * Update entries for a single Gmail message by ID, using the same logic as
+     * updateEntriesByAccountFilter() (status field + extra fields).
+     * Archives the message **only if** the account setting `archive_entries` is enabled.
+     *
+     * @return array{
+     *   idx:int, filter_index:int, statusFieldId:int,
+     *   archive_entries:bool, active_cron:bool,
+     *   updated:int, skipped_no_status_field:int, skipped_no_entry_id:int,
+     *   skipped_empty_status:int, errors:int, archived:int, archive_errors:int,
+     *   item: ?array
+     * }
+     */
+    public static function updateWithMessageId(int $idx, int $filterIndex, string $messageId, array $opts = []): array {
+        $account = self::getAccount($idx);
+
+        $archiveEnabled = !empty($account['archive_entries']); // respect settings
+        $activeCron     = !empty($account['active_cron']);
+
+        $summary = [
+            'idx'                     => $idx,
+            'filter_index'            => $filterIndex,
+            'statusFieldId'           => 0,
+            'archive_entries'         => (bool)$archiveEnabled,
+            'active_cron'             => (bool)$activeCron,
+            'updated'                 => 0,
+            'skipped_no_status_field' => 0,
+            'skipped_no_entry_id'     => 0,
+            'skipped_empty_status'    => 0,
+            'errors'                  => 0,
+            'archived'                => 0,
+            'archive_errors'          => 0,
+            'item'                    => null,
+        ];
+
+        if (!$account) {
+            $summary['errors'] = 1;
+            return $summary;
+        }
+
+        $filters = isset($account['filters']) && is_array($account['filters']) ? $account['filters'] : [];
+        if (!isset($filters[$filterIndex]) || !is_array($filters[$filterIndex])) {
+            $summary['errors'] = 1;
+            return $summary;
+        }
+
+        $filter        = $filters[$filterIndex];
+        $statusFieldId = isset($filter['status_field_id']) ? (int)$filter['status_field_id'] : 0;
+        $summary['statusFieldId'] = $statusFieldId;
+
+        // Fetch + parse this single message
+        $single = self::getMessageById($idx, $filterIndex, $messageId, $opts);
+        if (!empty($single['error'])) {
+            $summary['errors'] = 1;
+            return $summary;
+        }
+
+        $item = is_array($single['item'] ?? null) ? $single['item'] : null;
+        $summary['item'] = $item;
+
+        // Allow last-minute reordering/filtering via your existing hook
+        $items = $item ? [ $item ] : [];
+        $items = apply_filters('frm_gmail_before_update_entries', $items, $idx, $filterIndex, $account, $opts);
+        $item  = !empty($items) ? $items[0] : null;
+        $summary['item'] = $item;
+
+        // Test mode → just return the parsed item
+        if (!empty($opts['mode']) && $opts['mode'] === 'test') {
+            return $summary;
+        }
+
+        if ($statusFieldId <= 0) {
+            $summary['skipped_no_status_field'] = $item ? 1 : 0;
+            return $summary;
+        }
+
+        if (!$item) {
+            $summary['errors'] = 1;
+            return $summary;
+        }
+
+        $entryId = isset($item['entryId']) ? (int)$item['entryId'] : 0;
+        if ($entryId <= 0) {
+            $summary['skipped_no_entry_id'] = 1;
+            return $summary;
+        }
+
+        $status = isset($item['status']) ? (string)$item['status'] : '';
+        if ($status === '') {
+            $summary['skipped_empty_status'] = 1;
+            return $summary;
+        }
+
+        // Update main status field
+        $ok = FrmGmailEntryHelper::updateEntryMeta($entryId, $statusFieldId, $status);
+        if ($ok) { $summary['updated']++; } else { $summary['errors']++; }
+
+        // Update extras (if any)
+        if (!empty($item['extras']) && is_array($item['extras'])) {
+            foreach ($item['extras'] as $ex) {
+                $fieldId = isset($ex['entry_field_id']) ? (int)$ex['entry_field_id'] : 0;
+                $value   = $ex['value'] ?? '';
+                if ($fieldId > 0 && $value !== '') {
+                    FrmGmailEntryHelper::updateEntryMeta($entryId, $fieldId, $value);
+                }
+            }
+        }
+
+        // Optional: trigger post-update hook for single update too
+        do_action('frm_gmail_after_entry_update', $entryId);
+
+        // Archive the message if account setting allows and update succeeded
+        if ($archiveEnabled && $ok) {
+            $arch = self::maybeArchiveMessagesForAccount($idx, true, [ $messageId ]);
+            $summary['archived']       = $arch['archived'];
+            $summary['archive_errors'] = $arch['archive_errors'];
+        }
+
+        return $summary;
+    }
+
 
     /**
      * Update entries for **all filters** of a single account.
