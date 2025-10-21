@@ -463,6 +463,165 @@ final class FrmGmailParser {
     }
 
     /**
+     * Fetch and parse a single Gmail message by its ID, using the same logic as getAllMessages():
+     * - respects title_filter, status_search_area, order_id_search_area, mask, statuses
+     * - extracts extras (subject|body|body_text|body_html)
+     *
+     * @param int    $idx        Account index
+     * @param string $messageId  Gmail message ID
+     * @param array  $opts       Same options as getAllMessages (title_filter, statuses, status_search_area, order_id_search_area, mask, fidx, extra_fields, start_date)
+     *
+     * @return array{ item:?array, error:?string }
+     */
+    public static function getSingleMessage(int $idx, string $messageId, array $opts = []): array {
+        $row = FrmGmailParserHelper::getAccount($idx);
+        if (!$row) {
+            return ['item' => null, 'error' => 'Account not found.'];
+        }
+
+        $creds = $row['credentials'] ?? '';
+        $token = $row['token']       ?? null;
+        if ( empty($token) || !is_array($token) ) {
+            return ['item' => null, 'error' => 'Not connected.'];
+        }
+
+        // ---- statuses (same normalization as list flow) ----
+        $statuses = self::normalizeStatuses($opts, $idx);
+        if (empty($statuses)) {
+            return ['item' => null, 'error' => 'Please add at least one Status to test.'];
+        }
+        $statusesRx = array_map(fn($s) => '/' . preg_quote($s, '/') . '/i', $statuses);
+
+        // ---- areas ----
+        $statusAreas = (!empty($opts['status_search_area']) && is_array($opts['status_search_area']))
+            ? array_values(array_unique(array_map('trim', $opts['status_search_area'])))
+            : ['subject'];
+        $statusAreas = array_values(array_intersect($statusAreas, ['subject','body']));
+        if (empty($statusAreas)) { $statusAreas = ['subject']; }
+
+        $orderIdArea = (!empty($opts['order_id_search_area']) && in_array($opts['order_id_search_area'], ['to','from','subject'], true))
+            ? $opts['order_id_search_area']
+            : 'subject';
+
+        $maskText     = isset($opts['mask']) ? (string)$opts['mask'] : FrmGmailParserHelper::getMaskTextForAccount($idx);
+        $maskCompiled = self::parseOrderIdMask($maskText); // single or null
+
+        $titleFilter  = isset($opts['title_filter']) ? trim((string)$opts['title_filter']) : '';
+
+        // ---- resolve extras for this call (may be empty) ----
+        $extraFields = self::resolveExtrasForCall($idx, $opts);
+
+        try {
+            $api    = new FrmGmailApi($creds, $token);
+            $client = $api->makeClient();
+            if (!$client) {
+                return ['item' => null, 'error' => 'Invalid credentials JSON.'];
+            }
+
+            $client->setApplicationName('Gmail Parser (WP) - Account #' . ($idx + 1));
+            $client->setScopes([ \Google\Service\Gmail::GMAIL_READONLY ]);
+
+            // Refresh if needed
+            [$client, $newTok] = $api->ensureFreshToken($client);
+            if ($newTok) {
+                FrmGmailParserHelper::setTokenForAccount($idx, $newTok);
+            } elseif ( $client->isAccessTokenExpired() ) {
+                return ['item' => null, 'error' => 'Token expired and no refresh token present. Please Reconnect.'];
+            }
+
+            $gmail = new \Google\Service\Gmail($client);
+
+            // ---- Get FULL message ----
+            $msg = $gmail->users_messages->get('me', $messageId, ['format' => 'full']);
+
+            // Headers
+            $headers = [];
+            $payload = $msg->getPayload();
+            if ($payload && method_exists($payload, 'getHeaders') && $payload->getHeaders()) {
+                foreach ($payload->getHeaders() as $h) { $headers[$h->getName()] = $h->getValue(); }
+            }
+
+            $from        = $headers['From'] ?? '';
+            $deliveredTo = $headers['Delivered-To'] ?? ($headers['To'] ?? '');
+            $toHeader    = $headers['To'] ?? $deliveredTo;
+            $subject     = $headers['Subject'] ?? '';
+
+            // Optional Date (nice for UIs)
+            $dateHeader   = $headers['Date'] ?? '';
+            $internalDate = method_exists($msg, 'getInternalDate') ? $msg->getInternalDate() : null; // (ms)
+            $dateValue    = $internalDate ?: $dateHeader; // prefer internal when available
+
+            // Bodies
+            $bodies   = self::extractBodies($msg);
+            $bodyText = (string)($bodies['text'] ?? '');
+            $bodyHtml = (string)($bodies['html'] ?? '');
+
+            // ---- Title filter safeguard (should mirror list behavior) ----
+            if ($titleFilter !== '' && stripos($subject, $titleFilter) === false) {
+                return ['item' => null, 'error' => 'Title filter mismatch for this message.'];
+            }
+
+            // ---- Order Id Mask (single) on selected area ----
+            $entryId = '';
+            if ($maskCompiled) {
+                $fieldText = '';
+                switch ($orderIdArea) {
+                    case 'to':      $fieldText = $toHeader ?: $deliveredTo; break;
+                    case 'from':    $fieldText = $from; break;
+                    case 'subject': $fieldText = $subject; break;
+                }
+                if ($fieldText === '' || !preg_match($maskCompiled['regex'], $fieldText, $cap)) {
+                    // mask required → treat as not matched (same behavior as list flow)
+                    return ['item' => null, 'error' => 'Order Id Mask did not match for this message.'];
+                }
+                $entryId = $cap['entry_id'] ?? '';
+            }
+
+            // ---- Determine matched status respecting selected areas (OR logic for all statuses) ----
+            $matchedStatus = '';
+            foreach ($statusesRx as $i => $rx) {
+                $hit = false;
+                if (in_array('subject', $statusAreas, true) && preg_match($rx, $subject)) {
+                    $hit = true;
+                }
+                if (!$hit && in_array('body', $statusAreas, true)) {
+                    if (($bodyText !== '' && preg_match($rx, $bodyText)) || ($bodyHtml !== '' && preg_match($rx, $bodyHtml))) {
+                        $hit = true;
+                    }
+                }
+                if ($hit) { $matchedStatus = $statuses[$i]; break; }
+            }
+
+            // ---- Extra fields (extract per configured masks/areas) ----
+            $extras = [];
+            if (!empty($extraFields)) {
+                $extras = self::extractExtras($extraFields, $subject, $bodyText, $bodyHtml);
+            }
+
+            // Build item (keep keys consistent with getAllMessages)
+            $item = [
+                'id'          => $messageId,
+                'message_id'  => $messageId,
+                'gmailId'     => $messageId,
+                'from'        => $from,
+                'deliveredTo' => $deliveredTo,
+                'subject'     => $subject,
+                'status'      => $matchedStatus,
+                'entryId'     => $entryId,
+                'body'        => $bodyText,
+                'extras'      => $extras,
+                'date'        => $dateValue, // header "Date" or internalDate (ms)
+            ];
+
+            return ['item' => $item, 'error' => null];
+
+        } catch (\Throwable $e) {
+            return ['item' => null, 'error' => $e->getMessage()];
+        }
+    }
+
+
+    /**
      * Render the small preview block (uses getAllMessages()).
      * Shows up to 5 items, including the body snippet and EXTRA FIELDS (if configured).
      *
