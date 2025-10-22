@@ -2,11 +2,11 @@
 
 /**
  * Hidden admin page that lists ALL messages for a given Account (idx) + Parser code.
- * Adds a large, visible "Merchant Email Receipt: <date>" line and a right-side
- * "Test entry update" button per message that posts to admin-ajax with:
+ * Adds a right-side "Test entry update" button per message that posts to admin-ajax with:
  * - message_id
  * - account_id
  * - parser_id
+ * Shows an inline result below the button (green on success, red on error).
  */
 final class FrmGmailMessagesPage {
     private const PAGE_SLUG      = 'frm-gmail-messages';
@@ -34,7 +34,7 @@ final class FrmGmailMessagesPage {
 
     /** AJAX handler for the "Test entry update" button */
     public static function ajax_test_entry_update(): void {
-        
+
         if ( ! current_user_can(FrmGmailParserHelper::CAPABILITY) ) {
             wp_send_json_error([ 'message' => __('Permission denied', 'frm-gmail') ], 403);
         }
@@ -46,19 +46,18 @@ final class FrmGmailMessagesPage {
         $parser_id  = isset($_POST['parser_id']) ? absint($_POST['parser_id']) : -1;
 
         if ($message_id === '' || $account_id < 0 || $parser_id < 0) {
-            wp_send_json_error([ 'message' => __('Missing or invalid parameters.', 'frm-gmail') ], 400);
+            wp_send_json_error([ 'message' => __('Missing or invalid parameters', 'frm-gmail') ], 400);
         }
 
         $payload = FrmGmailParserHelper::updateWithMessageId($account_id, $parser_id, $message_id, [
             'mode' => 'live',
         ]);
-        
+
         if (!empty($payload['errors'])) {
-            wp_send_json_error([ 'message' => __('Update failed.', 'frm-gmail'), 'data' => $payload ], 400);
+            wp_send_json_error([ 'message' => __('Update failed', 'frm-gmail'), 'data' => $payload ], 400);
         }
-        
-        wp_send_json_success([ 'message' => __('Updated.', 'frm-gmail'), 'data' => $payload ]);
-        
+
+        wp_send_json_success([ 'message' => __('Updated', 'frm-gmail'), 'data' => $payload ]);
     }
 
     /** Render full messages page */
@@ -166,8 +165,6 @@ final class FrmGmailMessagesPage {
             return;
         }
 
-        $opts['idx'] = $_GET['idx'];
-
         $items = $result['items'];
         $count = count($items);
         echo '<p><strong>'.esc_html__('Total messages:', 'frm-gmail').'</strong> '.esc_html((string)$count).'</p>';
@@ -178,7 +175,7 @@ final class FrmGmailMessagesPage {
             return;
         }
 
-        // Styles
+        // Styles (adds inline result styles)
         echo '<style>
             .frm-mail-list .email-item{padding:12px 14px;border:1px solid #eee;border-radius:8px;margin-bottom:10px;background:#fff}
             .frm-mail-list .email-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
@@ -191,7 +188,7 @@ final class FrmGmailMessagesPage {
             .frm-mail-list .extras ul{margin:6px 0 0 18px;list-style:disc}
             .frm-mail-list .body{margin-top:8px;white-space:pre-wrap}
             .frm-mail-list code{background:#f6f8fa;border:1px solid #eee;border-radius:4px;padding:1px 4px}
-            .frm-mail-list .actions{min-width:180px;text-align:right}
+            .frm-mail-list .actions{min-width:220px;text-align:right}
             .frm-mail-list .btn-test-update{
                 display:inline-block;
                 padding:8px 12px;
@@ -204,6 +201,9 @@ final class FrmGmailMessagesPage {
                 font-weight:600;
             }
             .frm-mail-list .btn-test-update[disabled]{opacity:0.6;cursor:not-allowed}
+            .frm-mail-list .ajax-result{padding:3px 10px;border:1px solid transparent;border-radius:6px;font-size:12px;display:inline-block;text-align:right;}
+            .frm-mail-list .ajax-result.success{display:block; color:#1f6f1f}
+            .frm-mail-list .ajax-result.error{background:#ffecec;border-color:#e58a8a;color:#7f1d1d}
         </style>';
 
         echo '<div class="frm-mail-list">';
@@ -218,52 +218,37 @@ final class FrmGmailMessagesPage {
             elseif (!empty($row['id'])) { $message_id = (string)$row['id']; }
             elseif (!empty($row['gmailId'])) { $message_id = (string)$row['gmailId']; }
 
-            // Format a "Merchant Email Receipt" date
+            // Build a per-item result container ID
+            $result_id = 'ajax-result-' . esc_attr($message_id);
+
+            // Date line below subject
             $date_display = __('(unknown)', 'frm-gmail');
             $raw_date     = $row['date'] ?? ($row['internalDate'] ?? '');
             if ($raw_date !== '') {
-                $ts = null;
-                if (is_numeric($raw_date)) {
-                    // Gmail internalDate is usually ms. Normalize to seconds if it looks like ms.
-                    $ts = (int)$raw_date;
-                    if ($ts > 2000000000) { $ts = (int) floor($ts / 1000); }
-                } else {
-                    $ts = strtotime((string)$raw_date);
-                }
-                if ($ts) {
-                    // Use WP timezone formatting
-                    $date_display = date_i18n('M j, Y H:i', $ts);
-                }
+                $ts = is_numeric($raw_date) ? (int)$raw_date : strtotime((string)$raw_date);
+                if ($ts > 2000000000) { $ts = (int) floor($ts / 1000); }
+                if ($ts) { $date_display = date_i18n('M j, Y H:i', $ts); }
             }
 
             echo '<div class="email-item">';
 
                 echo '<div class="email-head">';
                     echo '<div class="left">';
-                        // Larger subject
                         echo '<div class="subject">'. esc_html($row['subject']) .'</div>';
-            
-                        // Smaller "Date:" line under subject
-                        $date_display = __('(unknown)', 'frm-gmail');
-                        $raw_date = $row['date'] ?? ($row['internalDate'] ?? '');
-                        if ($raw_date !== '') {
-                            $ts = is_numeric($raw_date) ? (int)$raw_date : strtotime((string)$raw_date);
-                            if ($ts > 2000000000) { $ts = (int) floor($ts / 1000); }
-                            if ($ts) { $date_display = date_i18n('M j, Y H:i', $ts); }
-                        }
                         echo '<div class="date-line"><span class="lbl">'.esc_html__('Date:', 'frm-gmail').'</span> '.esc_html($date_display).'</div>';
                     echo '</div>';
-            
-                    // Right-side button
+
+                    // Right-side button + inline result holder
                     echo '<div class="actions">';
                         echo '<button type="button" class="btn-test-update" '.
                                 'data-message-id="'. esc_attr($message_id) .'" '.
-                                'data-account-id="'. esc_attr( $opts['fidx'] ) .'" '.
-                                'data-parser-id="'. esc_attr( $opts['idx'] ) .'">'.
+                                'data-account-id="'. esc_attr((string)$idx) .'" '.
+                                'data-parser-id="'. esc_attr((string)$matchedIndex) .'">'.
                                 esc_html__('Test entry update', 'frm-gmail') .
-                            '</button>';
+                             '</button>';
+                        echo '<div class="ajax-result" id="'. $result_id .'" style="display:none;"></div>';
                     echo '</div>';
-            
+
                 echo '</div>'; // .email-head
 
                 // Meta
@@ -304,7 +289,7 @@ final class FrmGmailMessagesPage {
 
         echo '</div>'; // .frm-mail-list
 
-        // Inline JS – AJAX post on button click
+        // Inline JS – AJAX post on button click (shows inline result below the button)
         ?>
         <script>
         (function($){
@@ -313,27 +298,39 @@ final class FrmGmailMessagesPage {
                 var $btn = $(this);
                 if ($btn.is('[disabled]')) { return; }
 
+                var messageId = String($btn.data('message-id') || '');
+                var $result   = $('#ajax-result-' + messageId);
+                if (!$result.length) {
+                    $result = $('<div class="ajax-result" id="ajax-result-' + messageId + '"></div>').insertAfter($btn);
+                }
+
                 var payload = {
                     action: '<?php echo esc_js(self::AJAX_ACTION); ?>',
                     _ajax_nonce: $('#frm-gmail-messages-nonce').val(),
-                    message_id: $btn.data('message-id') || '',
+                    message_id: messageId,
                     account_id: $btn.data('account-id') || '',
                     parser_id:  $btn.data('parser-id')  || ''
                 };
 
                 $btn.attr('disabled', 'disabled').text('<?php echo esc_js(__('Testing…', 'frm-gmail')); ?>');
+                $result.removeClass('success error').hide().text('');
 
                 $.post(ajaxurl, payload)
                  .done(function(resp){
                     if (resp && resp.success) {
-                        alert('<?php echo esc_js(__('OK: Test request received.', 'frm-gmail')); ?>');
+                        var msg = (resp.data && resp.data.message) ? resp.data.message : '<?php echo esc_js(__('OK', 'frm-gmail')); ?>';
+                        $result.removeClass('error').addClass('ajax-result success').text(msg).show();
                     } else {
                         var msg = (resp && resp.data && resp.data.message) ? resp.data.message : '<?php echo esc_js(__('Unknown error', 'frm-gmail')); ?>';
-                        alert('<?php echo esc_js(__('Error:', 'frm-gmail')); ?> ' + msg);
+                        $result.removeClass('success').addClass('ajax-result error').text(msg).show();
                     }
                  })
-                 .fail(function(){
-                    alert('<?php echo esc_js(__('Network error', 'frm-gmail')); ?>');
+                 .fail(function(xhr){
+                    var msg = '<?php echo esc_js(__('Network error', 'frm-gmail')); ?>';
+                    if (xhr && xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message) {
+                        msg = xhr.responseJSON.data.message;
+                    }
+                    $result.removeClass('success').addClass('ajax-result error').text(msg).show();
                  })
                  .always(function(){
                     $btn.removeAttr('disabled').text('<?php echo esc_js(__('Test entry update', 'frm-gmail')); ?>');
