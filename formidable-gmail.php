@@ -25,7 +25,7 @@ function formidable_gmail_init() {
     
     if( isset( $_GET['gmail'] ) ) {
 
-        FrmGmailUpdateEntriesCron::run_one( 1, 1 );
+        FrmGmailUpdateEntriesCron::run_one( 0, 1 );
        
         /*echo "<pre>";
         print_r($res);
@@ -129,18 +129,13 @@ function custom_gmail_before_update_entries( $items, $account_idx, $filter_index
     unset($it);
 
     /*
-    $item_id = 3727;
-    $new = [];
+    $item_id = 43011;
     foreach( $items as $key=>$item ) {
-        if( 
-            $item['entryId'] == $item_id 
-            && $item['status'] == 'Shipped'
-            ) {
-            $new[] = $item;
+        if( $item['entryId'] != $item_id ) {
+            unset( $items[$key] );
         }
     }
-    $items = $new;
-    */
+    */    
     
     
     return $items;
